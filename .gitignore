@@ -1,0 +1,20 @@
+# dependencies
+node_modules/
+node_modules.tar.gz
+
+# secrets — NEVER commit these
+.env
+.env.local
+.env.*.local
+
+# logs
+*.log
+npm-debug.log*
+
+# editor
+.vscode/
+.idea/
+
+# os
+.DS_Store
+Thumbs.db
