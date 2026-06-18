@@ -47,6 +47,9 @@ app.use("/tenants", tenantsRoute);
 const adminRoute = require("./routes/admin");
 app.use("/admin", adminRoute);
 
+const storageRoute = require("./routes/storage");
+app.use("/storage", storageRoute);
+
 app.get("/", (req, res) => {
   res.status(200).json({ status: "OK", message: "Expense Tracker API running" });
 });
