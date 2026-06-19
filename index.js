@@ -63,8 +63,21 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: "Internal Server Error" });
 });
 
+// One-time, idempotent schema touch-ups for columns added after the initial
+// deploy. Safe to run on every boot; a no-op once applied.
+const pool = require("./dbClient");
+async function ensureSchema() {
+  try {
+    await pool.query(`ALTER TABLE tenant_settings ADD COLUMN IF NOT EXISTS name TEXT`);
+  } catch (err) {
+    console.error("Schema ensure skipped:", err.message);
+  }
+}
+
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => {
-  console.log(`Server running on http://localhost:${PORT}`);
-  console.log(`Swagger docs at http://localhost:${PORT}/api-docs`);
+ensureSchema().finally(() => {
+  app.listen(PORT, () => {
+    console.log(`Server running on http://localhost:${PORT}`);
+    console.log(`Swagger docs at http://localhost:${PORT}/api-docs`);
+  });
 });

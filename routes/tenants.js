@@ -12,9 +12,18 @@
 // a real tenants table later is a drop-in replacement.
 
 const express = require("express");
+const bcrypt = require("bcryptjs");
 const pool = require("../dbClient");
 
 const router = express.Router();
+
+// New users (the first tenant admin, invited employees) get this password until
+// a proper invite/reset flow lands — matches the seed scripts' convention.
+const DEFAULT_PASSWORD = "Demo@123";
+// Monthly recurring revenue per plan tier — mirrors the pricing shown in the
+// dashboard's "Create a tenant" form.
+const PLAN_MRR = { starter: 0, growth: 800, scale: 2400, enterprise: 6200 };
+const VALID_PLANS = new Set(Object.keys(PLAN_MRR));
 
 /**
  * @swagger
@@ -66,6 +75,7 @@ router.get("/", async (_req, res) => {
         t.admin_email,
         t.admin_name,
         COALESCE(v.volume, 0)::float AS monthly_expense_volume,
+        ts.name                       AS name,
         COALESCE(ts.plan, 'growth')   AS plan,
         COALESCE(ts.status, 'active') AS status,
         COALESCE(ts.mrr_amount, 0)::float AS mrr_amount
@@ -78,7 +88,7 @@ router.get("/", async (_req, res) => {
     const tenants = rows.map((r) => ({
       id: r.slug,
       slug: r.slug,
-      name: prettyName(r.slug),
+      name: r.name || prettyName(r.slug),
       plan: r.plan,
       status: r.status,
       userCount: r.user_count,
@@ -111,13 +121,14 @@ router.get("/:slug", async (req, res) => {
          MIN(e.created_at)                                     AS created_at,
          (SELECT email FROM employees WHERE tenant = $1 AND role = 'admin' ORDER BY created_at ASC LIMIT 1) AS admin_email,
          (SELECT name  FROM employees WHERE tenant = $1 AND role = 'admin' ORDER BY created_at ASC LIMIT 1) AS admin_name,
+         ts.name                                               AS name,
          COALESCE(ts.plan, 'growth')                           AS plan,
          COALESCE(ts.status, 'active')                         AS status,
          COALESCE(ts.mrr_amount, 0)::float                     AS mrr_amount
        FROM employees e
        LEFT JOIN tenant_settings ts ON ts.slug = e.tenant
        WHERE e.tenant = $1
-       GROUP BY e.tenant, ts.plan, ts.status, ts.mrr_amount`,
+       GROUP BY e.tenant, ts.name, ts.plan, ts.status, ts.mrr_amount`,
       [req.params.slug],
     );
     if (!rows.length) return res.status(404).json({ error: "Tenant not found" });
@@ -125,7 +136,7 @@ router.get("/:slug", async (req, res) => {
     return res.json({
       id: r.slug,
       slug: r.slug,
-      name: prettyName(r.slug),
+      name: r.name || prettyName(r.slug),
       plan: r.plan,
       status: r.status,
       userCount: r.user_count,
@@ -147,5 +158,122 @@ function prettyName(slug) {
     .replace(/[-_]/g, " ")
     .replace(/\b\w/g, (c) => c.toUpperCase());
 }
+
+/**
+ * @swagger
+ * /tenants:
+ *   post:
+ *     summary: Create a tenant (provisions its first admin employee)
+ *     tags: [Tenants]
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [name, adminName, adminEmail, plan]
+ *             properties:
+ *               name:            { type: string }
+ *               customSubdomain: { type: string }
+ *               adminName:       { type: string }
+ *               adminEmail:      { type: string }
+ *               plan:            { type: string, enum: [starter, growth, scale, enterprise] }
+ *     responses:
+ *       201: { description: Tenant created }
+ *       400: { description: Invalid input }
+ *       409: { description: Subdomain or admin email already in use }
+ */
+router.post("/", async (req, res) => {
+  const body = req.body || {};
+  const name = String(body.name || "").trim();
+  const adminName = String(body.adminName || "").trim();
+  const adminEmail = String(body.adminEmail || "").trim().toLowerCase();
+  const plan = String(body.plan || "growth").toLowerCase();
+  let slug = String(body.customSubdomain || "").trim().toLowerCase();
+  if (!slug) {
+    slug = name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+  }
+
+  if (!name) return res.status(400).json({ error: "Company name is required" });
+  if (!adminName) return res.status(400).json({ error: "Admin name is required" });
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(adminEmail)) {
+    return res.status(400).json({ error: "A valid admin email is required" });
+  }
+  if (!slug || !/^[a-z0-9.-]+$/.test(slug)) {
+    return res
+      .status(400)
+      .json({ error: "Subdomain may contain only lowercase letters, digits, dots and dashes" });
+  }
+  if (!VALID_PLANS.has(plan)) {
+    return res.status(400).json({ error: `plan must be one of: ${[...VALID_PLANS].join(", ")}` });
+  }
+
+  const client = await pool.connect();
+  try {
+    // A tenant "exists" once an employee row carries its slug — so the slug is
+    // taken if anyone already belongs to it.
+    const slugTaken = await client.query(`SELECT 1 FROM employees WHERE tenant = $1 LIMIT 1`, [slug]);
+    if (slugTaken.rows.length) {
+      return res.status(409).json({ error: `Subdomain "${slug}" is already taken` });
+    }
+    const emailTaken = await client.query(
+      `SELECT 1 FROM employees WHERE LOWER(email) = LOWER($1) LIMIT 1`,
+      [adminEmail],
+    );
+    if (emailTaken.rows.length) {
+      return res.status(409).json({ error: "An account with that admin email already exists" });
+    }
+
+    const passwordHash = await bcrypt.hash(DEFAULT_PASSWORD, 10);
+    const mrr = PLAN_MRR[plan];
+    const status = "trialing";
+
+    await client.query("BEGIN");
+
+    // 1. The tenant's first admin — this row is what makes the tenant real.
+    const { rows: empRows } = await client.query(
+      `INSERT INTO employees (email, name, role, tenant, password_hash)
+       VALUES ($1, $2, 'admin', $3, $4)
+       RETURNING created_at`,
+      [adminEmail, adminName, slug, passwordHash],
+    );
+
+    // 2. Plan / billing settings, including the company display name.
+    await client.query(
+      `INSERT INTO tenant_settings (slug, name, plan, status, mrr_amount)
+       VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (slug) DO UPDATE SET
+         name       = EXCLUDED.name,
+         plan       = EXCLUDED.plan,
+         status     = EXCLUDED.status,
+         mrr_amount = EXCLUDED.mrr_amount,
+         updated_at = NOW()`,
+      [slug, name, plan, status, mrr],
+    );
+
+    await client.query("COMMIT");
+
+    return res.status(201).json({
+      id: slug,
+      slug,
+      name,
+      plan,
+      status,
+      userCount: 1,
+      monthlyExpenseVolume: 0,
+      mrr,
+      createdAt: empRows[0].created_at,
+      customSubdomain: slug,
+      adminEmail,
+      adminName,
+    });
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    console.error("POST /tenants error:", err);
+    return res.status(500).json({ error: "Failed to create tenant" });
+  } finally {
+    client.release();
+  }
+});
 
 module.exports = router;

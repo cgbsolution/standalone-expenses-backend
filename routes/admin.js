@@ -33,7 +33,7 @@ function tenantRow(r) {
   return {
     id: r.slug,
     slug: r.slug,
-    name: prettyName(r.slug),
+    name: r.name || prettyName(r.slug),
     plan: r.plan || "growth",
     status: r.status || "active",
     userCount: Number(r.user_count) || 0,
@@ -193,6 +193,7 @@ router.get("/overview", async (_req, res) => {
         e.tenant                                                                              AS slug,
         MIN(e.created_at)                                                                      AS created_at,
         COUNT(*)::int                                                                          AS user_count,
+        ts.name                                                                                AS name,
         COALESCE(ts.plan, 'growth')                                                            AS plan,
         COALESCE(ts.status, 'active')                                                          AS status,
         COALESCE(ts.mrr_amount, 0)::float                                                      AS mrr_amount,
@@ -201,7 +202,7 @@ router.get("/overview", async (_req, res) => {
       FROM employees e
       LEFT JOIN tenant_settings ts ON ts.slug = e.tenant
       WHERE e.tenant IS NOT NULL AND e.tenant <> ''
-      GROUP BY e.tenant, ts.plan, ts.status, ts.mrr_amount
+      GROUP BY e.tenant, ts.name, ts.plan, ts.status, ts.mrr_amount
       ORDER BY MIN(e.created_at) DESC
       LIMIT 5
     `);
@@ -225,6 +226,7 @@ router.get("/overview", async (_req, res) => {
         pt.tenant                                                                            AS slug,
         pt.user_count,
         pt.volume                                                                            AS monthly_expense_volume,
+        ts.name                                                                              AS name,
         COALESCE(ts.plan, 'growth')                                                          AS plan,
         COALESCE(ts.status, 'active')                                                        AS status,
         COALESCE(ts.mrr_amount, 0)::float                                                    AS mrr_amount,

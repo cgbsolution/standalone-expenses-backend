@@ -11,9 +11,14 @@
 // guard when token issuance lands in /auth.
 
 const express = require("express");
+const bcrypt = require("bcryptjs");
 const pool = require("../dbClient");
 
 const router = express.Router();
+
+// Invited users get this password until a proper invite/reset flow lands —
+// matches the seed scripts' convention.
+const DEFAULT_PASSWORD = "Demo@123";
 
 function rowToUser(row) {
   const name = row.name || "";
@@ -222,6 +227,75 @@ router.put("/:email", async (req, res) => {
   } catch (err) {
     console.error("PUT /users/:email error:", err);
     return res.status(500).json({ error: "Failed to update user" });
+  }
+});
+
+/**
+ * @swagger
+ * /users:
+ *   post:
+ *     summary: Create (invite) an employee in a tenant
+ *     tags: [Users]
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [tenantSlug, email, displayName, role]
+ *             properties:
+ *               tenantSlug:   { type: string }
+ *               email:        { type: string }
+ *               displayName:  { type: string }
+ *               role:         { type: string, enum: [employee, admin] }
+ *               department:   { type: string }
+ *               employeeId:   { type: string }
+ *               managerEmail: { type: string }
+ *     responses:
+ *       201: { description: Created user }
+ *       400: { description: Invalid input }
+ *       409: { description: Email already in use }
+ */
+router.post("/", async (req, res) => {
+  const body = req.body || {};
+  const tenantSlug = String(body.tenantSlug || "").trim().toLowerCase();
+  const email = String(body.email || "").trim().toLowerCase();
+  const displayName = String(body.displayName || "").trim();
+  const role = String(body.role || "employee").toLowerCase();
+  const department = body.department ? String(body.department).trim() : null;
+  const employeeId = body.employeeId ? String(body.employeeId).trim() : null;
+  const managerEmail = body.managerEmail ? String(body.managerEmail).trim().toLowerCase() : null;
+
+  if (!tenantSlug) return res.status(400).json({ error: "tenantSlug is required" });
+  if (!displayName) return res.status(400).json({ error: "displayName is required" });
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    return res.status(400).json({ error: "A valid email is required" });
+  }
+  if (!ALLOWED_ROLES.has(role)) {
+    return res.status(400).json({ error: `role must be one of: ${[...ALLOWED_ROLES].join(", ")}` });
+  }
+
+  try {
+    const clash = await pool.query(
+      `SELECT 1 FROM employees WHERE LOWER(email) = LOWER($1) LIMIT 1`,
+      [email],
+    );
+    if (clash.rows.length) {
+      return res.status(409).json({ error: "Someone with that email is already on the team" });
+    }
+
+    const passwordHash = await bcrypt.hash(DEFAULT_PASSWORD, 10);
+    const { rows } = await pool.query(
+      `INSERT INTO employees
+         (email, name, role, tenant, department, employee_id, manager_email, password_hash)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       RETURNING *`,
+      [email, displayName, role, tenantSlug, department, employeeId, managerEmail, passwordHash],
+    );
+    return res.status(201).json(rowToUser(rows[0]));
+  } catch (err) {
+    console.error("POST /users error:", err);
+    return res.status(500).json({ error: "Failed to create user" });
   }
 });
 

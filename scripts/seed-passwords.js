@@ -112,6 +112,7 @@ async function main() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS tenant_settings (
       slug         TEXT PRIMARY KEY,
+      name         TEXT,
       plan         TEXT NOT NULL DEFAULT 'growth',
       status       TEXT NOT NULL DEFAULT 'active',
       mrr_amount   NUMERIC(10,2) NOT NULL DEFAULT 800,
@@ -119,6 +120,8 @@ async function main() {
       updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
   `);
+  // Added after initial deploy: a human-friendly company name per tenant.
+  await pool.query(`ALTER TABLE tenant_settings ADD COLUMN IF NOT EXISTS name TEXT`);
 
   // Explicit seed of known tenants. Add rows here to control plan + MRR.
   const TENANT_SETTINGS_SEED = [
