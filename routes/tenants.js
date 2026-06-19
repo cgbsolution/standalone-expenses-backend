@@ -12,14 +12,12 @@
 // a real tenants table later is a drop-in replacement.
 
 const express = require("express");
-const bcrypt = require("bcryptjs");
 const pool = require("../dbClient");
+const { safeNotify } = require("../notifier");
+const { createResetToken, buildResetUrl, INVITE_TTL_HOURS } = require("../utils/passwordTokens");
 
 const router = express.Router();
 
-// New users (the first tenant admin, invited employees) get this password until
-// a proper invite/reset flow lands — matches the seed scripts' convention.
-const DEFAULT_PASSWORD = "Demo@123";
 // Monthly recurring revenue per plan tier — mirrors the pricing shown in the
 // dashboard's "Create a tenant" form.
 const PLAN_MRR = { starter: 0, growth: 800, scale: 2400, enterprise: 6200 };
@@ -208,7 +206,10 @@ router.post("/", async (req, res) => {
     return res.status(400).json({ error: `plan must be one of: ${[...VALID_PLANS].join(", ")}` });
   }
 
+  const mrr = PLAN_MRR[plan];
+  const status = "trialing";
   const client = await pool.connect();
+  let createdAt;
   try {
     // A tenant "exists" once an employee row carries its slug — so the slug is
     // taken if anyone already belongs to it.
@@ -224,18 +225,15 @@ router.post("/", async (req, res) => {
       return res.status(409).json({ error: "An account with that admin email already exists" });
     }
 
-    const passwordHash = await bcrypt.hash(DEFAULT_PASSWORD, 10);
-    const mrr = PLAN_MRR[plan];
-    const status = "trialing";
-
     await client.query("BEGIN");
 
     // 1. The tenant's first admin — this row is what makes the tenant real.
+    //    No password is set: the admin gets an email to choose their own.
     const { rows: empRows } = await client.query(
-      `INSERT INTO employees (email, name, role, tenant, password_hash)
-       VALUES ($1, $2, 'admin', $3, $4)
+      `INSERT INTO employees (email, name, role, tenant)
+       VALUES ($1, $2, 'admin', $3)
        RETURNING created_at`,
-      [adminEmail, adminName, slug, passwordHash],
+      [adminEmail, adminName, slug],
     );
 
     // 2. Plan / billing settings, including the company display name.
@@ -252,21 +250,7 @@ router.post("/", async (req, res) => {
     );
 
     await client.query("COMMIT");
-
-    return res.status(201).json({
-      id: slug,
-      slug,
-      name,
-      plan,
-      status,
-      userCount: 1,
-      monthlyExpenseVolume: 0,
-      mrr,
-      createdAt: empRows[0].created_at,
-      customSubdomain: slug,
-      adminEmail,
-      adminName,
-    });
+    createdAt = empRows[0].created_at;
   } catch (err) {
     await client.query("ROLLBACK").catch(() => {});
     console.error("POST /tenants error:", err);
@@ -274,6 +258,41 @@ router.post("/", async (req, res) => {
   } finally {
     client.release();
   }
+
+  // Tenant exists now. Best-effort "set your password" link + email — an email
+  // hiccup must never fail a created tenant. The link is also returned so the
+  // super-admin can share it manually when email delivery isn't configured.
+  let inviteUrl = null;
+  try {
+    const token = await createResetToken(adminEmail, INVITE_TTL_HOURS);
+    inviteUrl = buildResetUrl(token);
+    safeNotify("account.invite", {
+      recipient: adminEmail,
+      name: adminName,
+      tenantName: name,
+      intro: `You've been set up as the admin for ${name} on ExpGenie. Click below to create your password and sign in. This link expires in 3 days.`,
+      ctaLabel: "Set your password",
+      actionUrl: inviteUrl,
+    });
+  } catch (err) {
+    console.error("POST /tenants invite-link error:", err);
+  }
+
+  return res.status(201).json({
+    id: slug,
+    slug,
+    name,
+    plan,
+    status,
+    userCount: 1,
+    monthlyExpenseVolume: 0,
+    mrr,
+    createdAt,
+    customSubdomain: slug,
+    adminEmail,
+    adminName,
+    inviteUrl,
+  });
 });
 
 module.exports = router;

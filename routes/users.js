@@ -11,14 +11,11 @@
 // guard when token issuance lands in /auth.
 
 const express = require("express");
-const bcrypt = require("bcryptjs");
 const pool = require("../dbClient");
+const { safeNotify } = require("../notifier");
+const { createResetToken, buildResetUrl, INVITE_TTL_HOURS } = require("../utils/passwordTokens");
 
 const router = express.Router();
-
-// Invited users get this password until a proper invite/reset flow lands —
-// matches the seed scripts' convention.
-const DEFAULT_PASSWORD = "Demo@123";
 
 function rowToUser(row) {
   const name = row.name || "";
@@ -284,15 +281,35 @@ router.post("/", async (req, res) => {
       return res.status(409).json({ error: "Someone with that email is already on the team" });
     }
 
-    const passwordHash = await bcrypt.hash(DEFAULT_PASSWORD, 10);
+    // No password is set: the invitee gets an email to choose their own.
     const { rows } = await pool.query(
       `INSERT INTO employees
-         (email, name, role, tenant, department, employee_id, manager_email, password_hash)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+         (email, name, role, tenant, department, employee_id, manager_email)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
        RETURNING *`,
-      [email, displayName, role, tenantSlug, department, employeeId, managerEmail, passwordHash],
+      [email, displayName, role, tenantSlug, department, employeeId, managerEmail],
     );
-    return res.status(201).json(rowToUser(rows[0]));
+    const user = rowToUser(rows[0]);
+
+    // Best-effort "set your password" link + email; also returned so an admin
+    // can share it manually when email delivery isn't configured.
+    let inviteUrl = null;
+    try {
+      const token = await createResetToken(email, INVITE_TTL_HOURS);
+      inviteUrl = buildResetUrl(token);
+      safeNotify("account.invite", {
+        recipient: email,
+        name: displayName,
+        tenantName: tenantSlug,
+        intro: `You've been invited to join ${tenantSlug} on ExpGenie. Click below to create your password and sign in. This link expires in 3 days.`,
+        ctaLabel: "Set your password",
+        actionUrl: inviteUrl,
+      });
+    } catch (mailErr) {
+      console.error("POST /users invite-link error:", mailErr);
+    }
+
+    return res.status(201).json({ ...user, inviteUrl });
   } catch (err) {
     console.error("POST /users error:", err);
     return res.status(500).json({ error: "Failed to create user" });

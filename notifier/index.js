@@ -145,7 +145,11 @@ async function notify(eventType, ctx) {
   }
 
   ctx._eventType = eventType; // used by enrichCtx for approver fallback
-  await enrichCtx(ctx);
+  // Only expense.* events carry an expense doc to enrich. Account emails
+  // (invites, password resets) bring their own ready-to-render context.
+  if (eventType.startsWith("expense.")) {
+    await enrichCtx(ctx);
+  }
 
   const { subject, html } = render(eventType, ctx);
   const provider = getProvider();

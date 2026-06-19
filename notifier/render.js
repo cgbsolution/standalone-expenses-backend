@@ -45,6 +45,14 @@ const EVENT_REGISTRY = {
     template: "expense_sap_status.html",
     subject: (ctx) => `Expense status update from SAP — ${ctx.newStatus || ""}`,
   },
+  "account.invite": {
+    template: "account_password.html",
+    subject: (ctx) => `You're invited to ${ctx.tenantName || "ExpGenie"} — set your password`,
+  },
+  "account.reset": {
+    template: "account_password.html",
+    subject: () => "Reset your ExpGenie password",
+  },
 };
 
 function render(eventType, ctx) {
