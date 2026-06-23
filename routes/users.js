@@ -316,4 +316,127 @@ router.post("/", async (req, res) => {
   }
 });
 
+const MAX_BULK_ROWS = 500;
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+/**
+ * @swagger
+ * /users/bulk:
+ *   post:
+ *     summary: Bulk-create employees in a tenant (skips existing emails)
+ *     tags: [Users]
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [tenantSlug, users]
+ *             properties:
+ *               tenantSlug: { type: string }
+ *               users:
+ *                 type: array
+ *                 items:
+ *                   type: object
+ *                   properties:
+ *                     email:              { type: string }
+ *                     displayName:        { type: string }
+ *                     role:               { type: string, enum: [employee, admin] }
+ *                     department:         { type: string }
+ *                     grade:              { type: string }
+ *                     employeeId:         { type: string }
+ *                     managerEmail:       { type: string }
+ *                     financeManagerEmail:{ type: string }
+ *     responses:
+ *       200: { description: "{ created, duplicates, invalid }" }
+ *       400: { description: Invalid input }
+ */
+router.post("/bulk", async (req, res) => {
+  const tenantSlug = String(req.body?.tenantSlug || "").trim().toLowerCase();
+  const rows = Array.isArray(req.body?.users) ? req.body.users : [];
+
+  if (!tenantSlug) return res.status(400).json({ error: "tenantSlug is required" });
+  if (!rows.length) return res.status(400).json({ error: "No rows to import" });
+  if (rows.length > MAX_BULK_ROWS) {
+    return res.status(400).json({ error: `Too many rows — max ${MAX_BULK_ROWS} per import` });
+  }
+
+  const created = [];
+  const duplicates = [];
+  const invalid = [];
+  const seenInFile = new Set();
+
+  try {
+    for (const raw of rows) {
+      const email = String(raw?.email || "").trim().toLowerCase();
+      const name = String(raw?.displayName || raw?.name || "").trim();
+      let role = String(raw?.role || "employee").toLowerCase();
+      if (!ALLOWED_ROLES.has(role)) role = "employee";
+
+      if (!EMAIL_RE.test(email) || !name) {
+        invalid.push({ email: raw?.email || "", reason: !name ? "Missing name" : "Invalid email" });
+        continue;
+      }
+      // De-dupe within the uploaded file itself.
+      if (seenInFile.has(email)) {
+        duplicates.push(email);
+        continue;
+      }
+      seenInFile.add(email);
+
+      const department = raw?.department ? String(raw.department).trim() : null;
+      const grade = raw?.grade ? String(raw.grade).trim() : null;
+      const employeeId = raw?.employeeId ? String(raw.employeeId).trim() : null;
+      const managerEmail = raw?.managerEmail ? String(raw.managerEmail).trim().toLowerCase() : null;
+      const financeManagerEmail = raw?.financeManagerEmail
+        ? String(raw.financeManagerEmail).trim().toLowerCase()
+        : null;
+
+      // ON CONFLICT DO NOTHING → RETURNING is empty when the email already
+      // exists, which is how we tell "created" from "duplicate".
+      const r = await pool.query(
+        `INSERT INTO employees
+           (email, name, role, tenant, department, grade, employee_id, manager_email, finance_manager_email)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+         ON CONFLICT (email) DO NOTHING
+         RETURNING email`,
+        [email, name, role, tenantSlug, department, grade, employeeId, managerEmail, financeManagerEmail],
+      );
+
+      if (!r.rows.length) {
+        duplicates.push(email);
+        continue;
+      }
+      created.push(email);
+
+      // Best-effort "set your password" invite — never block the import on email.
+      try {
+        const token = await createResetToken(email, INVITE_TTL_HOURS);
+        safeNotify("account.invite", {
+          recipient: email,
+          name,
+          tenantName: tenantSlug,
+          intro: `You've been added to ${tenantSlug} on ExpGenie. Click below to create your password and sign in. This link expires in 3 days.`,
+          ctaLabel: "Set your password",
+          actionUrl: buildResetUrl(token),
+        });
+      } catch (mailErr) {
+        console.error(`bulk invite-link error for ${email}:`, mailErr.message);
+      }
+    }
+
+    return res.json({
+      created,
+      duplicates,
+      invalid,
+      createdCount: created.length,
+      duplicateCount: duplicates.length,
+      invalidCount: invalid.length,
+    });
+  } catch (err) {
+    console.error("POST /users/bulk error:", err);
+    return res.status(500).json({ error: "Failed to import users" });
+  }
+});
+
 module.exports = router;
