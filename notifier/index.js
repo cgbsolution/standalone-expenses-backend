@@ -4,6 +4,7 @@
 // SAP polls can't email twice. The interface below stays the same.
 
 const { render } = require("./render");
+const pool = require("../dbClient");
 
 // One-time diagnostic line at module load — visible in the log stream so we
 // can confirm the deployed code can read the env vars.
@@ -157,13 +158,98 @@ async function notify(eventType, ctx) {
   return { eventType, recipient: ctx.recipient, ...result };
 }
 
+// Turn a workflow event into the in-app notification row shown in the app's
+// bell screen. Returns null for events that shouldn't surface there (account /
+// password emails). Assumes ctx.expense has been enriched (real names + amount).
+function buildInAppNotification(eventType, ctx) {
+  const expense = ctx.expense || {};
+  const title = expense.ExpenseTitle || expense.Title || "an expense";
+  const amount =
+    expense.TotalAmount !== undefined && expense.TotalAmount !== null && expense.TotalAmount !== ""
+      ? `₹${expense.TotalAmount}`
+      : "";
+  const amt = amount ? ` (${amount})` : "";
+  const submitterName =
+    ctx.employee?.FullName ||
+    (expense.SubmitterName || "").trim() ||
+    (expense.SubmitterEmail ? expense.SubmitterEmail.split("@")[0] : "Someone");
+  const approverName = ctx.approver?.FullName || "";
+  const expenseId = expense.id || expense.ExpenseId || null;
+
+  if (eventType === "expense.submitted" || eventType === "expense.resubmitted") {
+    // A manager approval that forwards to finance also fires "expense.submitted".
+    // Detect it from the latest history entry so the finance manager gets a
+    // clearer message than a plain "new submission".
+    const history = Array.isArray(expense.ApprovalHistory) ? expense.ApprovalHistory : [];
+    const last = history[history.length - 1] || {};
+    const forwardedToFinance =
+      /finance/i.test(last.action_status || "") ||
+      /forwarded to finance/i.test(last.comments || "");
+    const verb = eventType === "expense.resubmitted" ? "resubmitted" : "submitted";
+    return {
+      type: "approval_needed",
+      title: forwardedToFinance ? "Approval needed (Finance)" : "Approval needed",
+      body: forwardedToFinance
+        ? `Manager approved ${submitterName}'s "${title}"${amt} — your approval is needed.`
+        : `${submitterName} ${verb} "${title}"${amt} for your approval.`,
+      expenseId,
+      actorEmail: expense.SubmitterEmail || null,
+    };
+  }
+  if (eventType === "expense.approved") {
+    return {
+      type: "approved",
+      title: "Expense approved",
+      body: `"${title}"${amt} was approved${approverName ? ` by ${approverName}` : ""}.`,
+      expenseId,
+      actorEmail: expense.ApproverEmail || null,
+    };
+  }
+  if (eventType === "expense.rejected") {
+    const reason = (ctx.reason || expense.RejectionInfo?.Reason || "").trim();
+    return {
+      type: "rejected",
+      title: "Expense rejected",
+      body: `"${title}"${amt} was rejected${reason ? ` — ${reason}` : ""}.`,
+      expenseId,
+      actorEmail: expense.ApproverEmail || null,
+    };
+  }
+  return null;
+}
+
+// Persist an in-app notification. Independent of the NOTIFY_ENABLED email flag
+// so the in-app bell works even when outbound email is disabled. Never throws.
+async function recordInAppNotification(eventType, ctx) {
+  try {
+    if (!ctx || !ctx.recipient) return;
+    if (!eventType.startsWith("expense.")) return;
+    await enrichCtx(ctx); // real names + normalized amount (idempotent)
+    const n = buildInAppNotification(eventType, ctx);
+    if (!n) return;
+    await pool.query(
+      `INSERT INTO notifications
+         (recipient_email, type, title, body, expense_id, actor_email)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [ctx.recipient, n.type, n.title, n.body, n.expenseId, n.actorEmail]
+    );
+    console.log(`🔔 in-app notification stored: ${eventType} → ${ctx.recipient}`);
+  } catch (err) {
+    console.error(`🔔 recordInAppNotification(${eventType}) failed:`, err.message);
+  }
+}
+
 // Fire-and-forget wrapper used by HTTP route handlers.
-// - Respects NOTIFY_ENABLED feature flag (no-op when "false" or unset).
+// - Always records an in-app notification (bell screen).
+// - Sends email only when NOTIFY_ENABLED === "true".
 // - Logs and swallows errors; the API response must never wait on or fail
 //   because of email delivery.
 async function safeNotify(eventType, ctx) {
   // Log entry unconditionally — proves the route is calling us.
   console.log(`📧 safeNotify(${eventType}) called | recipient=${ctx?.recipient || "(none)"} | enabled=${process.env.NOTIFY_ENABLED}`);
+
+  // In-app notification is recorded regardless of the email feature flag.
+  await recordInAppNotification(eventType, ctx);
 
   if (process.env.NOTIFY_ENABLED !== "true") {
     console.log(`📧 safeNotify(${eventType}) skipped: NOTIFY_ENABLED is "${process.env.NOTIFY_ENABLED}", expected literal "true"`);
@@ -221,4 +307,4 @@ function pickEventForStatusChange(oldStatus, newStatus, resource) {
   return null;
 }
 
-module.exports = { notify, safeNotify, pickEventForStatusChange };
+module.exports = { notify, safeNotify, pickEventForStatusChange, recordInAppNotification };

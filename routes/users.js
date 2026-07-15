@@ -11,11 +11,30 @@
 // guard when token issuance lands in /auth.
 
 const express = require("express");
+const multer = require("multer");
 const pool = require("../dbClient");
 const { safeNotify } = require("../notifier");
 const { createResetToken, buildResetUrl, INVITE_TTL_HOURS } = require("../utils/passwordTokens");
+const { uploadPublicObject, isConfigured: isStorageConfigured } = require("../utils/supabaseStorage");
 
 const router = express.Router();
+
+// Avatars are small; keep the whole file in memory and hand the buffer to Supabase.
+const AVATAR_BUCKET = process.env.SUPABASE_AVATAR_BUCKET || "avatars";
+const ALLOWED_AVATAR_MIME = new Set(["image/jpeg", "image/png", "image/webp"]);
+const avatarUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024 }, // 5 MB
+});
+
+const EXT_BY_MIME = {
+  "image/jpeg": "jpg",
+  "image/png": "png",
+  "image/webp": "webp",
+};
+
+// Sign-in providers the user can pick on the mobile/dashboard Integrations row.
+const ALLOWED_INTEGRATION_PROVIDERS = new Set(["microsoft", "google", "email"]);
 
 function rowToUser(row) {
   const name = row.name || "";
@@ -41,6 +60,8 @@ function rowToUser(row) {
     tenant: tenantSlug,
     tenantSlug,
     authProvider: "local",
+    avatarUrl: row.avatar_url || null,
+    integrationProvider: row.integration_provider || null,
     createdAt: row.created_at,
   };
 }
@@ -436,6 +457,159 @@ router.post("/bulk", async (req, res) => {
   } catch (err) {
     console.error("POST /users/bulk error:", err);
     return res.status(500).json({ error: "Failed to import users" });
+  }
+});
+
+/**
+ * @swagger
+ * /users/{email}/profile:
+ *   patch:
+ *     summary: Self-service profile update (integration provider, avatar URL)
+ *     tags: [Users]
+ *     description: >
+ *       Unlike PUT /users/{email} (tenant-admin fields, blocks super-admins), this
+ *       endpoint covers fields a user edits about themselves and works for any role.
+ *     parameters:
+ *       - in: path
+ *         name: email
+ *         required: true
+ *         schema: { type: string }
+ *     requestBody:
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               integrationProvider: { type: string, enum: [microsoft, google, email] }
+ *               avatarUrl:           { type: string, nullable: true }
+ *     responses:
+ *       200: { description: Updated user }
+ *       400: { description: Invalid input }
+ *       404: { description: User not found }
+ */
+router.patch("/:email/profile", async (req, res) => {
+  try {
+    const body = req.body || {};
+    const setExpressions = [];
+    const values = [];
+    let i = 1;
+
+    if (Object.prototype.hasOwnProperty.call(body, "integrationProvider")) {
+      let provider = body.integrationProvider;
+      if (provider === null || provider === "") {
+        setExpressions.push(`integration_provider = $${i++}`);
+        values.push(null);
+      } else {
+        provider = String(provider).trim().toLowerCase();
+        if (!ALLOWED_INTEGRATION_PROVIDERS.has(provider)) {
+          return res.status(400).json({
+            error: `integrationProvider must be one of: ${[...ALLOWED_INTEGRATION_PROVIDERS].join(", ")}`,
+          });
+        }
+        setExpressions.push(`integration_provider = $${i++}`);
+        values.push(provider);
+      }
+    }
+
+    if (Object.prototype.hasOwnProperty.call(body, "avatarUrl")) {
+      const url = body.avatarUrl == null ? null : String(body.avatarUrl).trim() || null;
+      setExpressions.push(`avatar_url = $${i++}`);
+      values.push(url);
+    }
+
+    if (setExpressions.length === 0) {
+      return res.status(400).json({ error: "No updatable fields provided" });
+    }
+
+    values.push(req.params.email);
+    const { rows } = await pool.query(
+      `UPDATE employees
+          SET ${setExpressions.join(", ")},
+              updated_at = NOW()
+        WHERE LOWER(email) = LOWER($${i})
+    RETURNING *`,
+      values,
+    );
+
+    if (!rows.length) return res.status(404).json({ error: "User not found" });
+    return res.json(rowToUser(rows[0]));
+  } catch (err) {
+    console.error("PATCH /users/:email/profile error:", err);
+    return res.status(500).json({ error: "Failed to update profile" });
+  }
+});
+
+/**
+ * @swagger
+ * /users/{email}/avatar:
+ *   post:
+ *     summary: Upload a profile picture (multipart) and store its public URL
+ *     tags: [Users]
+ *     parameters:
+ *       - in: path
+ *         name: email
+ *         required: true
+ *         schema: { type: string }
+ *     requestBody:
+ *       content:
+ *         multipart/form-data:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               file: { type: string, format: binary }
+ *     responses:
+ *       200: { description: Updated user (with avatarUrl) }
+ *       400: { description: Missing/invalid file }
+ *       404: { description: User not found }
+ *       500: { description: Storage not configured / upload failed }
+ */
+router.post("/:email/avatar", avatarUpload.single("file"), async (req, res) => {
+  try {
+    if (!isStorageConfigured()) {
+      return res.status(500).json({ error: "Avatar storage is not configured" });
+    }
+    if (!req.file || !req.file.buffer?.length) {
+      return res.status(400).json({ error: "No image file uploaded" });
+    }
+
+    const mime = req.file.mimetype;
+    if (!ALLOWED_AVATAR_MIME.has(mime)) {
+      return res.status(400).json({ error: "Avatar must be a JPEG, PNG, or WebP image" });
+    }
+
+    // Confirm the user exists before spending an upload on a typo'd email.
+    const { rows: existing } = await pool.query(
+      `SELECT email FROM employees WHERE LOWER(email) = LOWER($1) LIMIT 1`,
+      [req.params.email],
+    );
+    if (!existing.length) return res.status(404).json({ error: "User not found" });
+    const email = existing[0].email;
+
+    // Deterministic-ish path keyed by email so re-uploads upsert in place; the
+    // unique suffix busts any CDN/client cache of the previous avatar.
+    const ext = EXT_BY_MIME[mime] || "jpg";
+    const safeEmail = email.toLowerCase().replace(/[^a-z0-9]+/g, "_");
+    const path = `${safeEmail}/avatar.${ext}`;
+
+    const publicUrl = await uploadPublicObject({
+      bucket: AVATAR_BUCKET,
+      path,
+      buffer: req.file.buffer,
+      contentType: mime,
+    });
+    // Cache-bust so clients holding the old URL fetch the new image.
+    const cacheBustedUrl = `${publicUrl}?v=${Date.now()}`;
+
+    const { rows } = await pool.query(
+      `UPDATE employees SET avatar_url = $1, updated_at = NOW()
+        WHERE LOWER(email) = LOWER($2)
+    RETURNING *`,
+      [cacheBustedUrl, email],
+    );
+    return res.json(rowToUser(rows[0]));
+  } catch (err) {
+    console.error("POST /users/:email/avatar error:", err);
+    return res.status(500).json({ error: "Failed to upload avatar" });
   }
 });
 

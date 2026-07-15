@@ -50,6 +50,9 @@ app.use("/admin", adminRoute);
 const storageRoute = require("./routes/storage");
 app.use("/storage", storageRoute);
 
+const notificationsRoute = require("./routes/notifications");
+app.use("/notifications", notificationsRoute);
+
 app.get("/", (req, res) => {
   res.status(200).json({ status: "OK", message: "Expense Tracker API running" });
 });
@@ -70,7 +73,31 @@ const { ensurePasswordResetTable } = require("./utils/passwordTokens");
 async function ensureSchema() {
   try {
     await pool.query(`ALTER TABLE tenant_settings ADD COLUMN IF NOT EXISTS name TEXT`);
+    // Self-service profile fields set from the mobile app / dashboard profile page.
+    await pool.query(`ALTER TABLE employees ADD COLUMN IF NOT EXISTS avatar_url TEXT`);
+    await pool.query(`ALTER TABLE employees ADD COLUMN IF NOT EXISTS integration_provider TEXT`);
     await ensurePasswordResetTable();
+
+    // In-app notifications. One row per workflow event (submitted / approved /
+    // rejected / resubmitted), addressed to a single recipient email. Written by
+    // the notifier at the same points the approval emails fire.
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS notifications (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        recipient_email TEXT NOT NULL,
+        type TEXT NOT NULL,
+        title TEXT NOT NULL,
+        body TEXT NOT NULL,
+        expense_id TEXT,
+        actor_email TEXT,
+        read BOOLEAN NOT NULL DEFAULT FALSE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_notifications_recipient
+      ON notifications (LOWER(recipient_email), created_at DESC)
+    `);
   } catch (err) {
     console.error("Schema ensure skipped:", err.message);
   }

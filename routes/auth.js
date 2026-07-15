@@ -39,6 +39,8 @@ function rowToUser(row) {
     tenant: tenantSlug,
     tenantSlug,
     authProvider: "local",
+    avatarUrl: row.avatar_url || null,
+    integrationProvider: row.integration_provider || null,
   };
 }
 
