@@ -256,6 +256,56 @@ router.get("/approver", async (req, res) => {
 
 /**
  * @swagger
+ * /master-expense/all:
+ *   get:
+ *     summary: Get every master expense (team-wide admin view), newest first
+ *     description: |
+ *       Returns all expenses regardless of submitter/approver. Intended for the
+ *       admin dashboard "Expenses" page. Note: expenses are not tenant-scoped in
+ *       the schema, so this returns everything — suitable for a single-company
+ *       deployment.
+ *     tags: [MasterExpense]
+ *     parameters:
+ *       - in: query
+ *         name: status
+ *         schema: { type: string, enum: [All, Pending, Approved, Rejected, Draft] }
+ *       - in: query
+ *         name: limit
+ *         schema: { type: integer, default: 500 }
+ *     responses:
+ *       200: { description: List of all master expenses }
+ *       500: { description: Failed to fetch expenses }
+ */
+router.get("/all", async (req, res) => {
+  const { status, limit } = req.query;
+  const lim = Math.min(Math.max(Number(limit) || 500, 1), 2000);
+  try {
+    let result;
+    if (status && status !== "All") {
+      result = await pool.query(
+        `SELECT * FROM expenses
+         WHERE approval_status = $1
+         ORDER BY created_at DESC
+         LIMIT $2`,
+        [status, lim]
+      );
+    } else {
+      result = await pool.query(
+        `SELECT * FROM expenses
+         ORDER BY created_at DESC
+         LIMIT $1`,
+        [lim]
+      );
+    }
+    return res.json(result.rows.map(rowToShape));
+  } catch (error) {
+    console.error("Error fetching all expenses:", error);
+    return res.status(500).json({ error: "Failed to fetch expenses." });
+  }
+});
+
+/**
+ * @swagger
  * /master-expense/counts:
  *   get:
  *     summary: Get counts of expenses by status (All, Approved, Rejected, Pending, Draft)

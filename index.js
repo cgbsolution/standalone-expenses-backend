@@ -53,6 +53,13 @@ app.use("/storage", storageRoute);
 const notificationsRoute = require("./routes/notifications");
 app.use("/notifications", notificationsRoute);
 
+const integrationsRoute = require("./routes/integrations");
+app.use("/integrations", integrationsRoute);
+
+app.use("/categories", require("./routes/categories"));
+app.use("/tenant-config", require("./routes/tenantConfig"));
+app.use("/rules", require("./routes/rules"));
+
 app.get("/", (req, res) => {
   res.status(200).json({ status: "OK", message: "Expense Tracker API running" });
 });
@@ -98,6 +105,58 @@ async function ensureSchema() {
       CREATE INDEX IF NOT EXISTS idx_notifications_recipient
       ON notifications (LOWER(recipient_email), created_at DESC)
     `);
+
+    // Per-tenant integration settings (SAP ERP posting, HRMS employee sync).
+    // One row per tenant slug; each provider's config lives in a JSONB blob so
+    // fields can evolve without migrations. Secrets are stored here but never
+    // returned by the API (see routes/integrations.js).
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS tenant_integrations (
+        slug TEXT PRIMARY KEY,
+        sap JSONB NOT NULL DEFAULT '{}'::jsonb,
+        hrms JSONB NOT NULL DEFAULT '{}'::jsonb,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+
+    // Expense categories (per tenant) — name, colour/icon, monthly budget, GL map.
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS expense_categories (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        slug TEXT NOT NULL,
+        name TEXT NOT NULL,
+        color TEXT NOT NULL DEFAULT '#6366F1',
+        icon TEXT NOT NULL DEFAULT 'folder',
+        monthly_budget NUMERIC NOT NULL DEFAULT 0,
+        gl_account TEXT NOT NULL DEFAULT '',
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_categories_slug ON expense_categories (slug)`);
+
+    // Workspace / platform configuration (per tenant slug; '__platform__' = global).
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS tenant_config (
+        slug TEXT PRIMARY KEY,
+        config JSONB NOT NULL DEFAULT '{}'::jsonb,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+
+    // Approval routing rules (per tenant) — conditions + action, priority-ordered.
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS approval_rules (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        slug TEXT NOT NULL,
+        name TEXT NOT NULL,
+        enabled BOOLEAN NOT NULL DEFAULT TRUE,
+        priority INT NOT NULL DEFAULT 0,
+        conditions JSONB NOT NULL DEFAULT '{}'::jsonb,
+        action TEXT NOT NULL DEFAULT 'route',
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_rules_slug ON approval_rules (slug)`);
   } catch (err) {
     console.error("Schema ensure skipped:", err.message);
   }
