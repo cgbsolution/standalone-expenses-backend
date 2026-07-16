@@ -205,6 +205,17 @@ function buildInAppNotification(eventType, ctx) {
       actorEmail: expense.ApproverEmail || null,
     };
   }
+  if (eventType === "expense.forwarded") {
+    // Intermediate step: manager approved, finance decides next. In-app only —
+    // there is no email template for this event.
+    return {
+      type: "approved",
+      title: "Approved by manager",
+      body: `"${title}"${amt} was approved by your manager and sent to Finance for final approval.`,
+      expenseId,
+      actorEmail: expense.ApproverEmail || null,
+    };
+  }
   if (eventType === "expense.rejected") {
     const reason = (ctx.reason || expense.RejectionInfo?.Reason || "").trim();
     return {

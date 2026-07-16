@@ -168,4 +168,7 @@ ensureSchema().finally(() => {
     console.log(`Server running on http://localhost:${PORT}`);
     console.log(`Swagger docs at http://localhost:${PORT}/api-docs`);
   });
+  // Catch expenses written straight into the DB (chatbot inserts bypass the
+  // API) and fire the notifications those rows never triggered.
+  require("./pollers/expenseNotificationsPoller").start();
 });

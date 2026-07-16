@@ -1,7 +1,7 @@
 const express = require("express");
 const { v4: uuidv4 } = require("uuid");
 const pool = require("../dbClient");
-const { safeNotify, pickEventForStatusChange } = require("../notifier");
+const { safeNotify, pickEventForStatusChange, recordInAppNotification } = require("../notifier");
 
 const router = express.Router();
 
@@ -536,13 +536,17 @@ async function updateStatus(id, body) {
 
   // Notifications:
   //   - Manager just approved (forwarding to finance): notify the finance manager
-  //     using the "expense.submitted" template (it reads as "new approval request").
+  //     using the "expense.submitted" template (it reads as "new approval request"),
+  //     AND tell the submitter their expense cleared the manager stage (in-app).
   //   - Finance approved (finalised): notify the submitter via "expense.approved".
   //   - Rejected: notify the submitter via "expense.rejected".
   if (ApprovalStatus === "Approved" && newApprovalStatus === "Pending" && newApproverEmail) {
-    setImmediate(() =>
-      safeNotify("expense.submitted", { expense: updated, recipient: newApproverEmail })
-    );
+    setImmediate(() => {
+      safeNotify("expense.submitted", { expense: updated, recipient: newApproverEmail });
+      if (submitterEmail) {
+        recordInAppNotification("expense.forwarded", { expense: updated, recipient: submitterEmail });
+      }
+    });
   } else {
     const ev = pickEventForStatusChange(oldStatus, newApprovalStatus, updated);
     if (ev) {
