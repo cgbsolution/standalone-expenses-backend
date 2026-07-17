@@ -256,6 +256,46 @@ router.get("/approver", async (req, res) => {
 
 /**
  * @swagger
+ * /master-expense/tenant:
+ *   get:
+ *     summary: All expenses belonging to a tenant (tenant-admin overview)
+ *     description: Every expense whose submitter OR approver is an employee of the tenant.
+ *     tags: [MasterExpense]
+ *     parameters:
+ *       - in: query
+ *         name: slug
+ *         required: true
+ *         schema: { type: string }
+ *     responses:
+ *       200: { description: List of the tenant's expenses }
+ *       400: { description: slug is required }
+ *       500: { description: Failed to fetch expenses }
+ */
+router.get("/tenant", async (req, res) => {
+  const { slug } = req.query;
+  if (!slug) return res.status(400).json({ error: "slug is required" });
+
+  try {
+    const { rows } = await pool.query(
+      `SELECT e.* FROM expenses e
+        WHERE EXISTS (
+          SELECT 1 FROM employees emp
+           WHERE emp.tenant = $1
+             AND (LOWER(emp.email) = LOWER(e.submitter_email)
+                  OR LOWER(emp.email) = LOWER(e.approver_email))
+        )
+        ORDER BY e.created_at DESC`,
+      [slug]
+    );
+    return res.json(rows.map(rowToShape));
+  } catch (error) {
+    console.error("Error fetching tenant expenses:", error);
+    return res.status(500).json({ error: "Failed to fetch tenant expenses." });
+  }
+});
+
+/**
+ * @swagger
  * /master-expense/all:
  *   get:
  *     summary: Get every master expense (team-wide admin view), newest first
