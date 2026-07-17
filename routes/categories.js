@@ -44,13 +44,15 @@ router.get("/", async (req, res) => {
 });
 
 router.post("/", async (req, res) => {
-  const { slug, name, color, icon, monthlyBudget, glAccount } = req.body || {};
+  const { slug, name, color, icon, monthlyBudget, glAccount, glProject, glCrm } = req.body || {};
   if (!slug || !name) return res.status(400).json({ error: "slug and name are required" });
   try {
     const { rows } = await pool.query(
-      `INSERT INTO expense_categories (slug, name, color, icon, monthly_budget, gl_account)
-       VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
-      [slug, name, color || "#6366F1", icon || "folder", Number(monthlyBudget) || 0, glAccount || ""],
+      `INSERT INTO expense_categories
+         (slug, name, color, icon, monthly_budget, gl_account, gl_project, gl_crm)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
+      [slug, name, color || "#6366F1", icon || "folder", Number(monthlyBudget) || 0,
+       glAccount || "", glProject || "", glCrm || ""],
     );
     return res.status(201).json(shape(rows[0]));
   } catch (e) {
@@ -60,7 +62,7 @@ router.post("/", async (req, res) => {
 });
 
 router.put("/:id", async (req, res) => {
-  const { name, color, icon, monthlyBudget, glAccount } = req.body || {};
+  const { name, color, icon, monthlyBudget, glAccount, glProject, glCrm } = req.body || {};
   try {
     const { rows } = await pool.query(
       `UPDATE expense_categories
@@ -68,7 +70,9 @@ router.put("/:id", async (req, res) => {
               color = COALESCE($3, color),
               icon = COALESCE($4, icon),
               monthly_budget = COALESCE($5, monthly_budget),
-              gl_account = COALESCE($6, gl_account)
+              gl_account = COALESCE($6, gl_account),
+              gl_project = COALESCE($7, gl_project),
+              gl_crm = COALESCE($8, gl_crm)
         WHERE id = $1 RETURNING *`,
       [
         req.params.id,
@@ -77,6 +81,8 @@ router.put("/:id", async (req, res) => {
         icon ?? null,
         monthlyBudget == null ? null : Number(monthlyBudget),
         glAccount ?? null,
+        glProject ?? null,
+        glCrm ?? null,
       ],
     );
     if (!rows.length) return res.status(404).json({ error: "Not found" });
