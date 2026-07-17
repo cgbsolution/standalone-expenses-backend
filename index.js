@@ -59,6 +59,7 @@ app.use("/integrations", integrationsRoute);
 app.use("/categories", require("./routes/categories"));
 app.use("/tenant-config", require("./routes/tenantConfig"));
 app.use("/rules", require("./routes/rules"));
+app.use("/master-config", require("./routes/masterConfig"));
 
 app.get("/", (req, res) => {
   res.status(200).json({ status: "OK", message: "Expense Tracker API running" });
@@ -133,6 +134,34 @@ async function ensureSchema() {
       )
     `);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_categories_slug ON expense_categories (slug)`);
+    // Master-sheet attributes on categories (bot enforces; dashboard displays).
+    await pool.query(`ALTER TABLE expense_categories ADD COLUMN IF NOT EXISTS normalized TEXT`);
+    await pool.query(`ALTER TABLE expense_categories ADD COLUMN IF NOT EXISTS requires_bill BOOLEAN NOT NULL DEFAULT TRUE`);
+    await pool.query(`ALTER TABLE expense_categories ADD COLUMN IF NOT EXISTS excluded_from_auto_approve BOOLEAN NOT NULL DEFAULT FALSE`);
+    await pool.query(`ALTER TABLE expense_categories ADD COLUMN IF NOT EXISTS enabled BOOLEAN NOT NULL DEFAULT TRUE`);
+    await pool.query(`ALTER TABLE expense_categories ADD COLUMN IF NOT EXISTS gl_project TEXT NOT NULL DEFAULT ''`);
+    await pool.query(`ALTER TABLE expense_categories ADD COLUMN IF NOT EXISTS gl_crm TEXT NOT NULL DEFAULT ''`);
+
+    // Per-tenant output/policy rules + grade-wise policy caps (from the master sheet).
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS tenant_rules (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        slug TEXT NOT NULL, rule_id TEXT NOT NULL,
+        enabled BOOLEAN NOT NULL DEFAULT TRUE, priority INT NOT NULL DEFAULT 0,
+        rule_group TEXT NOT NULL DEFAULT '', rule_type TEXT NOT NULL DEFAULT '',
+        params JSONB NOT NULL DEFAULT '{}'::jsonb,
+        UNIQUE (slug, rule_id)
+      )
+    `);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS tenant_policy_caps (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        slug TEXT NOT NULL, normalized TEXT NOT NULL, grade TEXT NOT NULL,
+        cap_amount NUMERIC NOT NULL DEFAULT 0,
+        is_actuals BOOLEAN NOT NULL DEFAULT FALSE, self_approve BOOLEAN NOT NULL DEFAULT TRUE,
+        UNIQUE (slug, normalized, grade)
+      )
+    `);
 
     // Workspace / platform configuration (per tenant slug; '__platform__' = global).
     await pool.query(`

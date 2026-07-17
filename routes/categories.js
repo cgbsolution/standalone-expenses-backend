@@ -18,6 +18,12 @@ function shape(r) {
     icon: r.icon,
     monthlyBudget: Number(r.monthly_budget) || 0,
     glAccount: r.gl_account || "",
+    normalized: r.normalized || "",
+    requiresBill: r.requires_bill !== false,
+    excludedFromAutoApprove: r.excluded_from_auto_approve === true,
+    enabled: r.enabled !== false,
+    glProject: r.gl_project || "",
+    glCrm: r.gl_crm || "",
     createdAt: r.created_at,
   };
 }

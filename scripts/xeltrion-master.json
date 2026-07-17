@@ -1,0 +1,373 @@
+{
+  "categories": [
+    {
+      "name": "Refreshment Expenses",
+      "normalized": "REFRESHMENTEXPENSES",
+      "requiresBill": true,
+      "excludedFromAutoApprove": false,
+      "enabled": true,
+      "glCorporate": "40100205",
+      "glProject": "40400003",
+      "glCrm": "40400004"
+    },
+    {
+      "name": "Business Promotion",
+      "normalized": "BUSINESSPROMOTION",
+      "requiresBill": true,
+      "excludedFromAutoApprove": false,
+      "enabled": true,
+      "glCorporate": "40203005",
+      "glProject": "40203005",
+      "glCrm": "40203005"
+    },
+    {
+      "name": "WiFi Reimbursement",
+      "normalized": "WIFIREIMBURSEMENT",
+      "requiresBill": true,
+      "excludedFromAutoApprove": false,
+      "enabled": true,
+      "glCorporate": "40203061",
+      "glProject": "40400003",
+      "glCrm": "40400004"
+    },
+    {
+      "name": "Telephone Reimbursement",
+      "normalized": "TELEPHONEREIMBURSEMENT",
+      "requiresBill": true,
+      "excludedFromAutoApprove": true,
+      "enabled": true,
+      "glCorporate": "40203061",
+      "glProject": "40400003",
+      "glCrm": "40400004"
+    },
+    {
+      "name": "Cab/Auto Charges (With Bill)",
+      "normalized": "CABAUTOCHARGESWITHBILL",
+      "requiresBill": true,
+      "excludedFromAutoApprove": false,
+      "enabled": true,
+      "glCorporate": "40203007",
+      "glProject": "40400003",
+      "glCrm": "40400004"
+    },
+    {
+      "name": "Four Wheeler Conveyance",
+      "normalized": "FOURWHEELERCONVEYANCE",
+      "requiresBill": false,
+      "excludedFromAutoApprove": false,
+      "enabled": true,
+      "glCorporate": "40203007",
+      "glProject": "40400003",
+      "glCrm": "40400004"
+    },
+    {
+      "name": "Two Wheeler Conveyance",
+      "normalized": "TWOWHEELERCONVEYANCE",
+      "requiresBill": false,
+      "excludedFromAutoApprove": false,
+      "enabled": true,
+      "glCorporate": "40203007",
+      "glProject": "40400003",
+      "glCrm": "40400004"
+    },
+    {
+      "name": "Cab/Auto Charges (Self-Declared)",
+      "normalized": "CABAUTOCHARGESSELFDECLARED",
+      "requiresBill": false,
+      "excludedFromAutoApprove": false,
+      "enabled": true,
+      "glCorporate": "40203007",
+      "glProject": "40400003",
+      "glCrm": "40400004"
+    },
+    {
+      "name": "Petrol Expenses",
+      "normalized": "PETROLEXPENSES",
+      "requiresBill": true,
+      "excludedFromAutoApprove": false,
+      "enabled": false,
+      "glCorporate": "40203009",
+      "glProject": "40203009",
+      "glCrm": "40203009"
+    }
+  ],
+  "rules": [
+    {
+      "ruleId": "default_currency",
+      "enabled": true,
+      "priority": 1,
+      "ruleGroup": "output",
+      "ruleType": "default_value",
+      "params": {
+        "field": "currency",
+        "value": "INR"
+      }
+    },
+    {
+      "ruleId": "default_tax_code",
+      "enabled": true,
+      "priority": 1,
+      "ruleGroup": "output",
+      "ruleType": "default_value",
+      "params": {
+        "field": "tax_code",
+        "value": "G0"
+      }
+    },
+    {
+      "ruleId": "expense_id_prefix",
+      "enabled": true,
+      "priority": 1,
+      "ruleGroup": "output",
+      "ruleType": "id_prefix",
+      "params": {
+        "field": "expense_id",
+        "value": "EXP-"
+      }
+    },
+    {
+      "ruleId": "employee_ref_prefix",
+      "enabled": true,
+      "priority": 1,
+      "ruleGroup": "output",
+      "ruleType": "id_prefix",
+      "params": {
+        "field": "employee_ref",
+        "value": "EMS-"
+      }
+    },
+    {
+      "ruleId": "posting_timezone",
+      "enabled": true,
+      "priority": 1,
+      "ruleGroup": "date",
+      "ruleType": "timezone",
+      "params": {
+        "value": "Asia/Kolkata"
+      }
+    },
+    {
+      "ruleId": "standard_policy_calculation",
+      "enabled": true,
+      "priority": 100,
+      "ruleGroup": "calculation",
+      "ruleType": "actuals_or_cap",
+      "params": {
+        "amount_field": "invoice_amount",
+        "cap_field": "policy_cap"
+      }
+    }
+  ],
+  "policyCaps": [
+    {
+      "normalized": "WIFIREIMBURSEMENT",
+      "grade": "MD",
+      "capAmount": 0.0,
+      "isActuals": true,
+      "selfApprove": true
+    },
+    {
+      "normalized": "TELEPHONEREIMBURSEMENT",
+      "grade": "MD",
+      "capAmount": 0.0,
+      "isActuals": true,
+      "selfApprove": true
+    },
+    {
+      "normalized": "WIFIREIMBURSEMENT",
+      "grade": "S",
+      "capAmount": 500.0,
+      "isActuals": false,
+      "selfApprove": true
+    },
+    {
+      "normalized": "TELEPHONEREIMBURSEMENT",
+      "grade": "S",
+      "capAmount": 500.0,
+      "isActuals": false,
+      "selfApprove": true
+    },
+    {
+      "normalized": "WIFIREIMBURSEMENT",
+      "grade": "RL4A",
+      "capAmount": 500.0,
+      "isActuals": false,
+      "selfApprove": true
+    },
+    {
+      "normalized": "WIFIREIMBURSEMENT",
+      "grade": "RL4B",
+      "capAmount": 500.0,
+      "isActuals": false,
+      "selfApprove": true
+    },
+    {
+      "normalized": "WIFIREIMBURSEMENT",
+      "grade": "RL4C",
+      "capAmount": 500.0,
+      "isActuals": false,
+      "selfApprove": true
+    },
+    {
+      "normalized": "WIFIREIMBURSEMENT",
+      "grade": "RL4D",
+      "capAmount": 500.0,
+      "isActuals": false,
+      "selfApprove": true
+    },
+    {
+      "normalized": "WIFIREIMBURSEMENT",
+      "grade": "RL5A",
+      "capAmount": 500.0,
+      "isActuals": false,
+      "selfApprove": true
+    },
+    {
+      "normalized": "TELEPHONEREIMBURSEMENT",
+      "grade": "RL5A",
+      "capAmount": 500.0,
+      "isActuals": false,
+      "selfApprove": true
+    },
+    {
+      "normalized": "WIFIREIMBURSEMENT",
+      "grade": "RL5B",
+      "capAmount": 500.0,
+      "isActuals": false,
+      "selfApprove": true
+    },
+    {
+      "normalized": "TELEPHONEREIMBURSEMENT",
+      "grade": "RL5B",
+      "capAmount": 500.0,
+      "isActuals": false,
+      "selfApprove": true
+    },
+    {
+      "normalized": "WIFIREIMBURSEMENT",
+      "grade": "RL5C",
+      "capAmount": 500.0,
+      "isActuals": false,
+      "selfApprove": true
+    },
+    {
+      "normalized": "TELEPHONEREIMBURSEMENT",
+      "grade": "RL5C",
+      "capAmount": 500.0,
+      "isActuals": false,
+      "selfApprove": true
+    },
+    {
+      "normalized": "TELEPHONEREIMBURSEMENT",
+      "grade": "RL4A",
+      "capAmount": 700.0,
+      "isActuals": false,
+      "selfApprove": true
+    },
+    {
+      "normalized": "TELEPHONEREIMBURSEMENT",
+      "grade": "RL4B",
+      "capAmount": 700.0,
+      "isActuals": false,
+      "selfApprove": true
+    },
+    {
+      "normalized": "TELEPHONEREIMBURSEMENT",
+      "grade": "RL4C",
+      "capAmount": 700.0,
+      "isActuals": false,
+      "selfApprove": true
+    },
+    {
+      "normalized": "TELEPHONEREIMBURSEMENT",
+      "grade": "RL4D",
+      "capAmount": 700.0,
+      "isActuals": false,
+      "selfApprove": true
+    },
+    {
+      "normalized": "WIFIREIMBURSEMENT",
+      "grade": "RL3C",
+      "capAmount": 800.0,
+      "isActuals": false,
+      "selfApprove": true
+    },
+    {
+      "normalized": "TELEPHONEREIMBURSEMENT",
+      "grade": "RL3C",
+      "capAmount": 800.0,
+      "isActuals": false,
+      "selfApprove": true
+    },
+    {
+      "normalized": "WIFIREIMBURSEMENT",
+      "grade": "RL3D",
+      "capAmount": 800.0,
+      "isActuals": false,
+      "selfApprove": true
+    },
+    {
+      "normalized": "TELEPHONEREIMBURSEMENT",
+      "grade": "RL3D",
+      "capAmount": 800.0,
+      "isActuals": false,
+      "selfApprove": true
+    },
+    {
+      "normalized": "WIFIREIMBURSEMENT",
+      "grade": "RL3A",
+      "capAmount": 1000.0,
+      "isActuals": false,
+      "selfApprove": true
+    },
+    {
+      "normalized": "TELEPHONEREIMBURSEMENT",
+      "grade": "RL3A",
+      "capAmount": 1000.0,
+      "isActuals": false,
+      "selfApprove": true
+    },
+    {
+      "normalized": "WIFIREIMBURSEMENT",
+      "grade": "RL3B",
+      "capAmount": 1000.0,
+      "isActuals": false,
+      "selfApprove": true
+    },
+    {
+      "normalized": "TELEPHONEREIMBURSEMENT",
+      "grade": "RL3B",
+      "capAmount": 1000.0,
+      "isActuals": false,
+      "selfApprove": true
+    },
+    {
+      "normalized": "WIFIREIMBURSEMENT",
+      "grade": "RL2A",
+      "capAmount": 1500.0,
+      "isActuals": false,
+      "selfApprove": true
+    },
+    {
+      "normalized": "TELEPHONEREIMBURSEMENT",
+      "grade": "RL2A",
+      "capAmount": 1500.0,
+      "isActuals": false,
+      "selfApprove": true
+    },
+    {
+      "normalized": "TELEPHONEREIMBURSEMENT",
+      "grade": "RL2B",
+      "capAmount": 1500.0,
+      "isActuals": false,
+      "selfApprove": true
+    },
+    {
+      "normalized": "TELEPHONEREIMBURSEMENT",
+      "grade": "RL2C",
+      "capAmount": 1500.0,
+      "isActuals": false,
+      "selfApprove": true
+    }
+  ]
+}

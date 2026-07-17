@@ -9,7 +9,8 @@
     "dev": "nodemon index.js",
     "smoke-test:notify": "node notifier/smoke-test.js",
     "seed:passwords": "node scripts/seed-passwords.js",
-    "seed:super-admin": "node scripts/seed-super-admin.js"
+    "seed:super-admin": "node scripts/seed-super-admin.js",
+    "seed:xeltrion": "node scripts/seed-xeltrion-master.js"
   },
   "keywords": [],
   "author": "Ives van Hoorne",
