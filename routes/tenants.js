@@ -295,4 +295,86 @@ router.post("/", async (req, res) => {
   });
 });
 
+const VALID_STATUSES = new Set(["active", "trialing", "suspended", "churned"]);
+
+/**
+ * @swagger
+ * /tenants/{slug}:
+ *   patch:
+ *     summary: Update a tenant's status and/or plan (super-admin)
+ *     tags: [Tenants]
+ *     parameters:
+ *       - in: path
+ *         name: slug
+ *         required: true
+ *         schema: { type: string }
+ *     requestBody:
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               status: { type: string, enum: [active, trialing, suspended, churned] }
+ *               plan:   { type: string, enum: [starter, growth, scale, enterprise] }
+ *     responses:
+ *       200: { description: Updated tenant settings }
+ *       400: { description: Invalid status/plan }
+ *       404: { description: Tenant not found }
+ */
+router.patch("/:slug", async (req, res) => {
+  const slug = String(req.params.slug || "").toLowerCase();
+  const { status, plan } = req.body || {};
+
+  if (status !== undefined && !VALID_STATUSES.has(String(status))) {
+    return res.status(400).json({ error: `status must be one of: ${[...VALID_STATUSES].join(", ")}` });
+  }
+  if (plan !== undefined && !VALID_PLANS.has(String(plan))) {
+    return res.status(400).json({ error: `plan must be one of: ${[...VALID_PLANS].join(", ")}` });
+  }
+  if (status === undefined && plan === undefined) {
+    return res.status(400).json({ error: "Nothing to update — pass status and/or plan" });
+  }
+
+  try {
+    // Tenant exists once an employee carries its slug — reuse that as the check.
+    const exists = await pool.query(`SELECT 1 FROM employees WHERE tenant = $1 LIMIT 1`, [slug]);
+    if (!exists.rows.length) return res.status(404).json({ error: "Tenant not found" });
+
+    const sets = [];
+    const vals = [slug];
+    if (status !== undefined) { vals.push(String(status)); sets.push(`status = $${vals.length}`); }
+    if (plan !== undefined) {
+      vals.push(String(plan)); sets.push(`plan = $${vals.length}`);
+      vals.push(PLAN_MRR[String(plan)]); sets.push(`mrr_amount = $${vals.length}`);
+    }
+
+    // Upsert so tenants that pre-date tenant_settings still get a row.
+    const insertCols = ["slug"];
+    const insertVals = ["$1"];
+    if (status !== undefined) { insertCols.push("status"); insertVals.push(`$2`); }
+    if (plan !== undefined) {
+      insertCols.push("plan", "mrr_amount");
+      insertVals.push(`$${status !== undefined ? 3 : 2}`, `$${status !== undefined ? 4 : 3}`);
+    }
+    const { rows } = await pool.query(
+      `INSERT INTO tenant_settings (${insertCols.join(", ")})
+       VALUES (${insertVals.join(", ")})
+       ON CONFLICT (slug) DO UPDATE SET ${sets.join(", ")}, updated_at = NOW()
+       RETURNING slug, name, plan, status, mrr_amount`,
+      vals,
+    );
+    const r = rows[0];
+    return res.json({
+      slug: r.slug,
+      name: r.name,
+      plan: r.plan,
+      status: r.status,
+      mrr: Number(r.mrr_amount) || 0,
+    });
+  } catch (e) {
+    console.error("Error updating tenant:", e);
+    return res.status(500).json({ error: "Failed to update tenant." });
+  }
+});
+
 module.exports = router;
