@@ -250,6 +250,56 @@ router.put("/:email", async (req, res) => {
 
 /**
  * @swagger
+ * /users/{email}:
+ *   delete:
+ *     summary: Remove an employee from a tenant
+ *     tags: [Users]
+ *     parameters:
+ *       - in: path
+ *         name: email
+ *         required: true
+ *         schema: { type: string }
+ *     responses:
+ *       200: { description: Deleted }
+ *       403: { description: Cannot delete a super-admin }
+ *       404: { description: User not found }
+ *       409: { description: Cannot delete the tenant's only admin }
+ */
+router.delete("/:email", async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT email, role, tenant FROM employees WHERE LOWER(email) = LOWER($1) LIMIT 1`,
+      [req.params.email],
+    );
+    if (!rows.length) return res.status(404).json({ error: "User not found" });
+    const u = rows[0];
+
+    if (u.role === "super_admin") {
+      return res.status(403).json({ error: "Super-admin accounts can't be deleted here." });
+    }
+    // Don't orphan a tenant — keep at least one admin.
+    if (u.role === "admin" && u.tenant) {
+      const { rows: a } = await pool.query(
+        `SELECT COUNT(*)::int AS n FROM employees WHERE tenant = $1 AND role = 'admin'`,
+        [u.tenant],
+      );
+      if ((a[0]?.n || 0) <= 1) {
+        return res.status(409).json({
+          error: "This is the tenant's only admin. Make another user an admin first.",
+        });
+      }
+    }
+
+    await pool.query(`DELETE FROM employees WHERE LOWER(email) = LOWER($1)`, [req.params.email]);
+    return res.json({ deleted: true });
+  } catch (e) {
+    console.error("Error deleting user:", e);
+    return res.status(500).json({ error: "Failed to delete user." });
+  }
+});
+
+/**
+ * @swagger
  * /users:
  *   post:
  *     summary: Create (invite) an employee in a tenant
