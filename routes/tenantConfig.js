@@ -17,6 +17,11 @@ const DEFAULTS = {
   autoApproveUnder: 0,
   notifyByEmail: true,
   brandColor: "",
+  // Super-admin only. When a tenant has no SAP connection, payments can't be
+  // posted automatically — turning this on lets that tenant's finance approver
+  // tick "payment done" by hand after final approval. See POST
+  // /master-expense/:id/payment, which refuses unless this flag is true.
+  manualPaymentEnabled: false,
 };
 
 const ALLOWED = Object.keys(DEFAULTS);

@@ -216,6 +216,18 @@ function buildInAppNotification(eventType, ctx) {
       actorEmail: expense.ApproverEmail || null,
     };
   }
+  if (eventType === "expense.paid") {
+    // Manual payment tick by finance (tenants without SAP). In-app only —
+    // there is no email template for this event.
+    const ref = (expense.PaymentInfo?.Reference || "").trim();
+    return {
+      type: "reimbursed",
+      title: "Payment completed",
+      body: `"${title}"${amt} has been paid${ref ? ` — ref ${ref}` : ""}.`,
+      expenseId,
+      actorEmail: expense.PaymentInfo?.PaidBy || null,
+    };
+  }
   if (eventType === "expense.rejected") {
     const reason = (ctx.reason || expense.RejectionInfo?.Reason || "").trim();
     return {

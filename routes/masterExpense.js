@@ -59,6 +59,9 @@ function rowToShape(row) {
     ApprovalStatus: row.approval_status,
     ExpenseId: row.unique_key,
     SubmissionDate: row.data?.SubmissionDate || row.created_at,
+    // Always present so clients can branch without an undefined check. Only
+    // ever leaves "Unpaid" via POST /master-expense/:id/payment.
+    PaymentStatus: row.data?.PaymentStatus || "Unpaid",
     _ts: Math.floor(new Date(row.updated_at || row.created_at).getTime() / 1000),
   };
 }
@@ -669,6 +672,212 @@ router.put("/by-id/:id", async (req, res) => {
     const status = error.status || 500;
     if (status === 500) console.error("Error updating ApprovalStatus:", error);
     return res.status(status).json({ error: error.message || "Failed to update ApprovalStatus." });
+  }
+});
+
+/* ------------------------------------------------------------------ *
+ * Manual payment marking
+ *
+ * For tenants with no SAP connection there is nothing to post the approved
+ * expense to, so payment never gets recorded anywhere. A super-admin can turn
+ * on `manualPaymentEnabled` for such a tenant (tenant_config); the finance
+ * approver who finalised the expense then ticks it off by hand here.
+ *
+ * The flag is deliberately checked server-side on every call — the dashboard
+ * hides the button, but the endpoint must not rely on that.
+ * ------------------------------------------------------------------ */
+
+// Which tenant does this expense belong to? Expenses have no tenant column, so
+// resolve it the same way GET /tenant does — through the people on the record.
+// Submitter first (they're the one whose policy applies), approver as fallback.
+async function resolveExpenseTenant(row) {
+  const candidates = [row.submitter_email, row.approver_email].filter(Boolean);
+  for (const email of candidates) {
+    const { rows } = await pool.query(
+      `SELECT tenant FROM employees WHERE LOWER(email) = LOWER($1) LIMIT 1`,
+      [email],
+    );
+    if (rows[0]?.tenant) return rows[0].tenant;
+  }
+  return "";
+}
+
+async function isManualPaymentEnabled(slug) {
+  if (!slug) return false;
+  const { rows } = await pool.query(
+    `SELECT config FROM tenant_config WHERE slug = $1`,
+    [slug],
+  );
+  return Boolean(rows[0]?.config?.manualPaymentEnabled);
+}
+
+// The finance approver on the record can mark their own approval paid; tenant
+// admins can too (they cover for finance). Super-admins are unrestricted.
+async function canMarkPaid(actorEmail, row, slug) {
+  const actor = (actorEmail || "").toLowerCase();
+  if (!actor) return false;
+  if (actor === (row.approver_email || "").toLowerCase()) return true;
+
+  const { rows } = await pool.query(
+    `SELECT role, tenant FROM employees WHERE LOWER(email) = LOWER($1) LIMIT 1`,
+    [actorEmail],
+  );
+  const employee = rows[0];
+  if (!employee) return false;
+  const role = (employee.role || "").toLowerCase();
+  if (role === "super_admin") return true;
+  return role === "admin" && employee.tenant === slug;
+}
+
+/**
+ * @swagger
+ * /master-expense/{id}/payment:
+ *   post:
+ *     summary: Manually record that an approved expense has been paid
+ *     description: |
+ *       Only available when the expense's tenant has `manualPaymentEnabled`
+ *       turned on by a super-admin (used when the tenant has no SAP connection
+ *       to post payments through). The caller must be the finance approver on
+ *       the expense, a tenant admin, or a super-admin.
+ *     tags: [MasterExpense]
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema: { type: string }
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [UpdatedBy]
+ *             properties:
+ *               UpdatedBy:        { type: string, description: Email of the finance user }
+ *               Paid:             { type: boolean, default: true, description: false reverses the mark }
+ *               PaymentReference: { type: string, description: UTR / cheque / voucher no. }
+ *               PaymentDate:      { type: string, description: "ISO date; defaults to now" }
+ *               PaymentNote:      { type: string }
+ *     responses:
+ *       200: { description: Updated expense }
+ *       400: { description: UpdatedBy is required }
+ *       403: { description: Caller may not mark this expense paid }
+ *       404: { description: Expense not found }
+ *       409: { description: Not approved yet, or manual payment not enabled for the tenant }
+ */
+router.post("/:id/payment", async (req, res) => {
+  const { id } = req.params;
+  const { UpdatedBy, PaymentReference, PaymentDate, PaymentNote } = req.body || {};
+  const paid = req.body?.Paid !== false; // default true
+
+  if (!UpdatedBy) {
+    return res.status(400).json({ error: "UpdatedBy is required" });
+  }
+
+  try {
+    const { rows: existingRows } = await pool.query(
+      `SELECT * FROM expenses WHERE id = $1`,
+      [id],
+    );
+    if (!existingRows.length) {
+      return res.status(404).json({ error: "Expense not found" });
+    }
+
+    const row = existingRows[0];
+    // Tolerant match: the chatbot writes variants like "ApprovedByFinance"
+    // straight into the DB, and clients normalize anything starting with
+    // "approv" to Approved. Match that rather than the exact literal.
+    if (!/^approv/i.test(row.approval_status || "")) {
+      return res.status(409).json({
+        error: "Only fully approved expenses can be marked as paid.",
+      });
+    }
+
+    const slug = await resolveExpenseTenant(row);
+    if (!slug) {
+      return res.status(409).json({
+        error: "Could not resolve the tenant for this expense.",
+      });
+    }
+    if (!(await isManualPaymentEnabled(slug))) {
+      return res.status(409).json({
+        error: "Manual payment marking is not enabled for this tenant.",
+      });
+    }
+    if (!(await canMarkPaid(UpdatedBy, row, slug))) {
+      return res.status(403).json({
+        error: "Only the finance approver on this expense or a tenant admin can record payment.",
+      });
+    }
+
+    // Idempotent: re-ticking an already-paid expense is a no-op, so a double
+    // click doesn't stack duplicate history entries.
+    const alreadyPaid = (row.data?.PaymentStatus || "Unpaid") === "Paid";
+    if (paid === alreadyPaid) {
+      return res.json(rowToShape(row));
+    }
+
+    const now = new Date().toISOString();
+    const paidAt = paid ? (PaymentDate ? new Date(PaymentDate).toISOString() : now) : null;
+
+    const historyEntry = {
+      at: now,
+      by: UpdatedBy,
+      from: alreadyPaid ? "Paid" : "Unpaid",
+      to: paid ? "Paid" : "Unpaid",
+      action_status: paid ? "Payment Recorded" : "Payment Reversed",
+      comments: paid
+        ? `Payment marked as done manually by ${UpdatedBy}` +
+          (PaymentReference ? ` (ref ${PaymentReference})` : "") +
+          (PaymentNote ? `. ${PaymentNote}` : ".")
+        : `Manual payment mark reversed by ${UpdatedBy}.`,
+    };
+
+    const mergedData = {
+      ...row.data,
+      PaymentStatus: paid ? "Paid" : "Unpaid",
+      PaymentInfo: paid
+        ? {
+            Method: "Manual",
+            PaidAt: paidAt,
+            PaidBy: UpdatedBy,
+            Reference: PaymentReference || "",
+            Note: PaymentNote || "",
+          }
+        : null,
+      LastActionAt: now,
+      ApprovalHistory: [
+        ...(Array.isArray(row.data?.ApprovalHistory) ? row.data.ApprovalHistory : []),
+        historyEntry,
+      ],
+    };
+
+    const { rows: updatedRows } = await pool.query(
+      `UPDATE expenses SET data = $1, updated_at = NOW() WHERE id = $2 RETURNING *`,
+      [mergedData, id],
+    );
+
+    const updated = rowToShape(updatedRows[0]);
+    console.log(
+      `POST /master-expense/${id}/payment ${paid ? "paid" : "unpaid"} ` +
+      `tenant=${slug} by=${UpdatedBy} ref=${PaymentReference || "(none)"}`,
+    );
+
+    // In-app only — there is no email template for payment, and the submitter
+    // is the only one who needs to hear about it.
+    if (paid && row.submitter_email) {
+      setImmediate(() =>
+        recordInAppNotification("expense.paid", {
+          expense: updated,
+          recipient: row.submitter_email,
+        }),
+      );
+    }
+
+    return res.json(updated);
+  } catch (error) {
+    console.error("Error recording payment:", error);
+    return res.status(500).json({ error: "Failed to record payment." });
   }
 });
 
