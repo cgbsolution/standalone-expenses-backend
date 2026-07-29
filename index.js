@@ -134,6 +134,12 @@ async function ensureSchema() {
       )
     `);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_categories_slug ON expense_categories (slug)`);
+    // A category name is unique within a tenant. Also the ON CONFLICT target
+    // used by scripts/copy-tenant-config.js — without it that script errors on
+    // a freshly-provisioned database.
+    await pool.query(
+      `CREATE UNIQUE INDEX IF NOT EXISTS uq_categories_slug_name ON expense_categories (slug, name)`
+    );
     // Master-sheet attributes on categories (bot enforces; dashboard displays).
     await pool.query(`ALTER TABLE expense_categories ADD COLUMN IF NOT EXISTS normalized TEXT`);
     await pool.query(`ALTER TABLE expense_categories ADD COLUMN IF NOT EXISTS requires_bill BOOLEAN NOT NULL DEFAULT TRUE`);

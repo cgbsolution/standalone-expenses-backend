@@ -27,12 +27,45 @@ function getProvider() {
   throw new Error(`Unknown NOTIFY_PROVIDER: ${name}`);
 }
 
-// Pulls submitter info from the existing /employee-info endpoint so templates
-// can render real names (e.g. "Tushar Ganatra") instead of raw emails.
+// Pulls submitter info so templates can render real names instead of raw
+// emails. Reads our own `employees` table first — it is the source of truth and
+// covers every tenant. The external /employee-info service is only a fallback
+// for deployments still relying on it, and is skipped entirely when unset.
 // Always fills ctx.employee with at least { FullName: <fallback> }.
-const EMPLOYEE_INFO_URL =
-  process.env.EMPLOYEE_INFO_URL ||
-  "https://ocr-validations-hnh3e7g2bkhhf6hq.southeastasia-01.azurewebsites.net/employee-info";
+const EMPLOYEE_INFO_URL = process.env.EMPLOYEE_INFO_URL || "";
+
+// Look up an employee locally. Returns null when there's no row, so callers can
+// decide whether to try the external service.
+async function localEmployeeInfo(email) {
+  if (!email) return null;
+  try {
+    const { rows } = await pool.query(
+      `SELECT name, email, grade, department, manager_email, finance_manager_email,
+              company_code, vendor_code, cost_center, section_code, employee_id, tenant
+         FROM employees WHERE LOWER(email) = LOWER($1) LIMIT 1`,
+      [email],
+    );
+    const r = rows[0];
+    if (!r) return null;
+    return {
+      FullName: r.name || "",
+      PrimaryEmail: r.email,
+      Grade: r.grade,
+      Department: r.department,
+      ManagerEmail: r.manager_email,
+      FinanceManagerEmail: r.finance_manager_email,
+      CompanyCode: r.company_code,
+      VendorCode: r.vendor_code,
+      CostCenter: r.cost_center,
+      SectionCode: r.section_code,
+      EmployeeId: r.employee_id,
+      Tenant: r.tenant,
+    };
+  } catch (err) {
+    console.warn(`localEmployeeInfo(${email}) failed:`, err.message);
+    return null;
+  }
+}
 
 // Some expense docs (especially those written by the chatbot's expenseagent-dev
 // backend) don't carry a top-level TotalAmount. Compute it from the line items
@@ -96,6 +129,13 @@ function ensureSubmissionDate(expense) {
 
 async function fetchEmployeeInfo(email) {
   if (!email) return {};
+
+  // Our own table first — every tenant's employees live here.
+  const local = await localEmployeeInfo(email);
+  if (local) return local;
+
+  // Optional legacy fallback; skipped unless EMPLOYEE_INFO_URL is configured.
+  if (!EMPLOYEE_INFO_URL) return {};
   try {
     const url = `${EMPLOYEE_INFO_URL}?emp_email=${encodeURIComponent(email)}`;
     const resp = await fetch(url);

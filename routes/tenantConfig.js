@@ -22,6 +22,11 @@ const DEFAULTS = {
   // tick "payment done" by hand after final approval. See POST
   // /master-expense/:id/payment, which refuses unless this flag is true.
   manualPaymentEnabled: false,
+  // Super-admin only. "No Policy" mode: the bot stops applying spending caps,
+  // grade matching, self-approval and blocking rules for this tenant — every
+  // bill goes Manager → Finance on its full amount. Duplicate detection and
+  // categorisation still apply. Read by the bot via tenant_config.
+  noPolicyMode: false,
 };
 
 const ALLOWED = Object.keys(DEFAULTS);

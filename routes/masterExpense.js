@@ -907,12 +907,26 @@ router.post("/:id/payment", async (req, res) => {
  *       200: { description: Notification accepted }
  *       400: { description: Missing fields or no recipient resolvable }
  */
-const EMPLOYEE_INFO_URL =
-  process.env.EMPLOYEE_INFO_URL ||
-  "https://ocr-validations-hnh3e7g2bkhhf6hq.southeastasia-01.azurewebsites.net/employee-info";
+// Optional legacy employee-info service. Unset by default — the `employees`
+// table below is the source of truth and covers every tenant, whereas the
+// external service only knows one customer's directory.
+const EMPLOYEE_INFO_URL = process.env.EMPLOYEE_INFO_URL || "";
 
 async function lookupManagerEmail(submitterEmail) {
   if (!submitterEmail) return "";
+
+  // Our own table first.
+  try {
+    const { rows } = await pool.query(
+      `SELECT manager_email FROM employees WHERE LOWER(email) = LOWER($1) LIMIT 1`,
+      [submitterEmail],
+    );
+    if (rows[0]?.manager_email) return rows[0].manager_email;
+  } catch (e) {
+    console.warn("lookupManagerEmail (local) failed:", e.message);
+  }
+
+  if (!EMPLOYEE_INFO_URL) return "";
   try {
     const url = `${EMPLOYEE_INFO_URL}?emp_email=${encodeURIComponent(submitterEmail)}`;
     const resp = await fetch(url);

@@ -2,17 +2,30 @@
 // output/policy rules, and grade-wise policy caps — from one tenant to another.
 // Idempotent (upserts on the natural keys), so safe to re-run.
 //
-// Run:  node scripts/copy-tenant-config.js <fromSlug> <toSlug>
+// Run:  node scripts/copy-tenant-config.js <fromSlug> <toSlug> [--categories-only] [--dry-run]
 //   e.g. node scripts/copy-tenant-config.js xeltrion cgb-solutions
+//        node scripts/copy-tenant-config.js cgb-solutions artboxsolutions --categories-only
+//
+//   --categories-only  copy categories (+ GL codes & flags) but NOT rules or
+//                      grade-wise caps. Use when the target tenant hasn't set
+//                      employee grades yet, or runs in No-Policy mode — caps
+//                      keyed by grade would never match anything there.
+//   --dry-run          report what would be copied, write nothing.
 
 require("dotenv").config();
 const pool = require("../dbClient");
 
-const FROM = (process.argv[2] || "").toLowerCase();
-const TO = (process.argv[3] || "").toLowerCase();
+const args = process.argv.slice(2).filter((a) => !a.startsWith("--"));
+const flags = new Set(process.argv.slice(2).filter((a) => a.startsWith("--")));
+const FROM = (args[0] || "").toLowerCase();
+const TO = (args[1] || "").toLowerCase();
+const CATEGORIES_ONLY = flags.has("--categories-only");
+const DRY_RUN = flags.has("--dry-run");
 
 if (!FROM || !TO) {
-  console.error("Usage: node scripts/copy-tenant-config.js <fromSlug> <toSlug>");
+  console.error(
+    "Usage: node scripts/copy-tenant-config.js <fromSlug> <toSlug> [--categories-only] [--dry-run]"
+  );
   process.exit(1);
 }
 if (FROM === TO) {
@@ -21,7 +34,31 @@ if (FROM === TO) {
 }
 
 async function main() {
-  console.log(`Copying master config: ${FROM} → ${TO}`);
+  console.log(
+    `Copying ${CATEGORIES_ONLY ? "categories" : "master config"}: ${FROM} → ${TO}` +
+    (DRY_RUN ? "  [DRY RUN — nothing will be written]" : "")
+  );
+
+  // Show what's there before touching anything.
+  const preview = await pool.query(
+    `SELECT name, gl_account, normalized, requires_bill, enabled
+       FROM expense_categories WHERE slug = $1 ORDER BY name`,
+    [FROM],
+  );
+  const existing = await pool.query(
+    `SELECT COUNT(*)::int AS n FROM expense_categories WHERE slug = $1`,
+    [TO],
+  );
+  console.log(`  source has ${preview.rows.length} categories; target currently has ${existing.rows[0].n}`);
+  for (const r of preview.rows) {
+    console.log(`    · ${r.name}  GL=${r.gl_account || "-"}  bill=${r.requires_bill}  enabled=${r.enabled}`);
+  }
+
+  if (DRY_RUN) {
+    console.log("\nDry run — no changes made.");
+    await pool.end();
+    return;
+  }
 
   const cats = await pool.query(
     `INSERT INTO expense_categories
@@ -39,6 +76,13 @@ async function main() {
     [FROM, TO],
   );
   console.log(`  categories: ${cats.rowCount}`);
+
+  if (CATEGORIES_ONLY) {
+    console.log("  rules / policy caps: skipped (--categories-only)");
+    console.log("Done.");
+    await pool.end();
+    return;
+  }
 
   const rules = await pool.query(
     `INSERT INTO tenant_rules (slug, rule_id, enabled, priority, rule_group, rule_type, params)
