@@ -532,6 +532,10 @@ async function updateStatus(id, body) {
     action_status: actionLabel,
   };
 
+  // Keep the system routing note even when the approver typed their own comment,
+  // so "Approved by Manager. Forwarded to Finance (...)" isn't lost.
+  if (routeNote && Comments) historyEntry.note = routeNote;
+
   const newDataPatches = { LastActionAt: now };
 
   if (ApprovalStatus === "Approved" && newApprovalStatus === "Approved") {
@@ -620,6 +624,9 @@ async function updateStatus(id, body) {
  *             required: [ApprovalStatus]
  *             properties:
  *               ApprovalStatus: { type: string }
+ *               UpdatedBy: { type: string, description: Email of the approver taking the action }
+ *               Comments: { type: string, description: Optional approver comment, stored in ApprovalHistory }
+ *               RejectionReason: { type: string, description: Reason code, only used when rejecting }
  *     responses:
  *       200: { description: Status updated successfully }
  *       400: { description: ApprovalStatus is required }
