@@ -14,6 +14,7 @@
 
 const express = require("express");
 const pool = require("../dbClient");
+const access = require("../middleware/auth");
 
 const router = express.Router();
 
@@ -54,7 +55,8 @@ function tenantRow(r) {
  *     responses:
  *       200: { description: Aggregated overview payload }
  */
-router.get("/overview", async (_req, res) => {
+router.get("/overview", async (req, res) => {
+  if (!access.requireSuper(req)) return access.deny(res);
   try {
     // 1. KPI snapshot — single round-trip with subqueries. `all_expenses` is
     //    every expense plus a computed total that falls back to summing the
@@ -343,6 +345,7 @@ const COMPUTED_TOTAL_EXPR = `COALESCE(
 router.get("/tenant-overview", async (req, res) => {
   const tenant = req.query.tenant;
   if (!tenant) return res.status(400).json({ error: "tenant query param is required" });
+  if (!access.canAdminTenant(req, tenant)) return access.deny(res);
 
   try {
     // 1. KPI snapshot. `te` is the tenant's expenses with a pre-computed `amt`.

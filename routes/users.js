@@ -6,9 +6,9 @@
 //   GET /users?role=admin            → users with a role (combinable with tenant)
 //   GET /users/:email                → one user
 //
-// Trust-client pattern: matches the existing /master-expense routes, which
-// already accept caller-provided email/tenant params. Replace with a JWT-based
-// guard when token issuance lands in /auth.
+// Access: a tenant admin sees and manages their own tenant's people; a
+// super-admin sees everyone; anyone may read and edit their own profile.
+// (middleware/auth.js decides; nothing here trusts a tenant or email from the request.)
 
 const express = require("express");
 const multer = require("multer");
@@ -16,6 +16,7 @@ const pool = require("../dbClient");
 const { safeNotify } = require("../notifier");
 const { createResetToken, buildResetUrl, INVITE_TTL_HOURS } = require("../utils/passwordTokens");
 const { uploadPublicObject, isConfigured: isStorageConfigured } = require("../utils/supabaseStorage");
+const access = require("../middleware/auth");
 
 const router = express.Router();
 
@@ -86,7 +87,14 @@ function rowToUser(row) {
  *       200: { description: List of users }
  */
 router.get("/", async (req, res) => {
-  const { tenant, role, q } = req.query;
+  const { role, q } = req.query;
+  let { tenant } = req.query;
+  if (req.auth && !access.isSuper(req)) {
+    // A tenant admin lists their own tenant only, whatever was asked for.
+    if (req.auth.role !== "admin") return access.deny(res);
+    if (tenant && tenant !== req.auth.tenant) return access.deny(res);
+    tenant = req.auth.tenant;
+  }
   const filters = [];
   const params = [];
 
@@ -126,6 +134,7 @@ router.get("/", async (req, res) => {
  */
 router.get("/:email", async (req, res) => {
   try {
+    if (!(await access.canActFor(req, req.params.email))) return access.deny(res);
     const { rows } = await pool.query(
       `SELECT * FROM employees WHERE LOWER(email) = LOWER($1) LIMIT 1`,
       [req.params.email],
@@ -204,6 +213,7 @@ router.put("/:email", async (req, res) => {
     if (existing.role === "super_admin") {
       return res.status(403).json({ error: "Super-admin profiles can't be edited here" });
     }
+    if (!access.canAdminTenant(req, existing.tenant)) return access.deny(res);
 
     const body = req.body || {};
     const setExpressions = [];
@@ -277,6 +287,7 @@ router.delete("/:email", async (req, res) => {
     if (u.role === "super_admin") {
       return res.status(403).json({ error: "Super-admin accounts can't be deleted here." });
     }
+    if (!access.canAdminTenant(req, u.tenant)) return access.deny(res);
     // Don't orphan a tenant — keep at least one admin.
     if (u.role === "admin" && u.tenant) {
       const { rows: a } = await pool.query(
@@ -335,6 +346,7 @@ router.post("/", async (req, res) => {
   const managerEmail = body.managerEmail ? String(body.managerEmail).trim().toLowerCase() : null;
 
   if (!tenantSlug) return res.status(400).json({ error: "tenantSlug is required" });
+  if (!access.canAdminTenant(req, tenantSlug)) return access.deny(res);
   if (!displayName) return res.status(400).json({ error: "displayName is required" });
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
     return res.status(400).json({ error: "A valid email is required" });
@@ -427,6 +439,7 @@ router.post("/bulk", async (req, res) => {
   const rows = Array.isArray(req.body?.users) ? req.body.users : [];
 
   if (!tenantSlug) return res.status(400).json({ error: "tenantSlug is required" });
+  if (!access.canAdminTenant(req, tenantSlug)) return access.deny(res);
   if (!rows.length) return res.status(400).json({ error: "No rows to import" });
   if (rows.length > MAX_BULK_ROWS) {
     return res.status(400).json({ error: `Too many rows — max ${MAX_BULK_ROWS} per import` });
@@ -539,6 +552,9 @@ router.post("/bulk", async (req, res) => {
  */
 router.patch("/:email/profile", async (req, res) => {
   try {
+    if (req.auth && !access.sameEmail(req.auth.email, req.params.email) && !access.isSuper(req)) {
+      return access.deny(res, "You can only change your own profile.");
+    }
     const body = req.body || {};
     const setExpressions = [];
     const values = [];
@@ -615,6 +631,7 @@ router.patch("/:email/profile", async (req, res) => {
  */
 router.post("/:email/avatar", avatarUpload.single("file"), async (req, res) => {
   try {
+    if (!(await access.canActFor(req, req.params.email))) return access.deny(res);
     if (!isStorageConfigured()) {
       return res.status(500).json({ error: "Avatar storage is not configured" });
     }

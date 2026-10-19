@@ -16,8 +16,15 @@
 
 const express = require("express");
 const pool = require("../dbClient");
+const access = require("../middleware/auth");
 
 const router = express.Router();
+
+// Every route here is /:slug/...; only that tenant's admins (or a super-admin) get past.
+router.use("/:slug", (req, res, next) => {
+  if (!access.canAdminTenant(req, req.params.slug)) return access.deny(res);
+  return next();
+});
 
 // ---- shapes -------------------------------------------------------------
 
@@ -131,7 +138,7 @@ router.put("/:slug/policy-caps/:id", async (req, res) => {
               cap_amount   = COALESCE($4, cap_amount),
               is_actuals   = COALESCE($5, is_actuals),
               self_approve = COALESCE($6, self_approve)
-        WHERE id = $1 RETURNING *`,
+        WHERE id = $1 AND slug = $7 RETURNING *`,
       [
         req.params.id,
         normalized == null ? null : String(normalized).trim(),
@@ -139,6 +146,7 @@ router.put("/:slug/policy-caps/:id", async (req, res) => {
         capAmount == null ? null : Number(capAmount),
         isActuals == null ? null : isActuals === true,
         selfApprove == null ? null : selfApprove === true,
+        req.params.slug,
       ],
     );
     if (!rows.length) return res.status(404).json({ error: "Not found" });
@@ -152,8 +160,8 @@ router.put("/:slug/policy-caps/:id", async (req, res) => {
 router.delete("/:slug/policy-caps/:id", async (req, res) => {
   try {
     const { rowCount } = await pool.query(
-      `DELETE FROM tenant_policy_caps WHERE id = $1`,
-      [req.params.id],
+      `DELETE FROM tenant_policy_caps WHERE id = $1 AND slug = $2`,
+      [req.params.id, req.params.slug],
     );
     if (!rowCount) return res.status(404).json({ error: "Not found" });
     return res.json({ deleted: true });
@@ -210,7 +218,7 @@ router.put("/:slug/rules/:id", async (req, res) => {
               rule_group = COALESCE($5, rule_group),
               rule_type  = COALESCE($6, rule_type),
               params     = COALESCE($7, params)
-        WHERE id = $1 RETURNING *`,
+        WHERE id = $1 AND slug = $8 RETURNING *`,
       [
         req.params.id,
         ruleId == null ? null : String(ruleId).trim(),
@@ -219,6 +227,7 @@ router.put("/:slug/rules/:id", async (req, res) => {
         ruleGroup == null ? null : ruleGroup,
         ruleType == null ? null : ruleType,
         params == null ? null : parseParams(params),
+        req.params.slug,
       ],
     );
     if (!rows.length) return res.status(404).json({ error: "Not found" });
@@ -232,8 +241,8 @@ router.put("/:slug/rules/:id", async (req, res) => {
 router.delete("/:slug/rules/:id", async (req, res) => {
   try {
     const { rowCount } = await pool.query(
-      `DELETE FROM tenant_rules WHERE id = $1`,
-      [req.params.id],
+      `DELETE FROM tenant_rules WHERE id = $1 AND slug = $2`,
+      [req.params.id, req.params.slug],
     );
     if (!rowCount) return res.status(404).json({ error: "Not found" });
     return res.json({ deleted: true });

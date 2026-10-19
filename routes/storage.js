@@ -1,6 +1,37 @@
 const express = require("express");
+const pool = require("../dbClient");
+const access = require("../middleware/auth");
 
 const router = express.Router();
+
+// The expense a receipt belongs to: the EARLIEST one that references it. Expense
+// bodies are written by their submitters, so anyone could paste someone else's
+// receipt path into their own expense — but only after the original exists, so
+// the original owner is the earliest reference.
+async function receiptOwner(rawPath) {
+  const { rows } = await pool.query(
+    `SELECT e.*
+       FROM expenses e
+      WHERE EXISTS (
+        SELECT 1
+          FROM jsonb_array_elements(
+                 CASE WHEN jsonb_typeof(e.data->'ExpenseData') = 'array'
+                      THEN e.data->'ExpenseData' ELSE '[]'::jsonb END) AS item
+         WHERE item->>'ReceiptUrl' = $1
+            OR item->>'SasUrl' = $1
+            OR EXISTS (
+              SELECT 1
+                FROM jsonb_array_elements(
+                       CASE WHEN jsonb_typeof(item->'File') = 'array'
+                            THEN item->'File' ELSE '[]'::jsonb END) AS f
+               WHERE $1 IN (f->>'blob_url', f->>'url', f->>'sas_url', f->>'sasUrl',
+                            f->>'SasUrl', f->>'path', f->>'link')))
+      ORDER BY e.created_at ASC
+      LIMIT 1`,
+    [rawPath],
+  );
+  return rows[0] || null;
+}
 
 // Supabase Storage signing. Receipts live in a PRIVATE bucket, so the DB stores
 // each file as an S3 URI (e.g. "s3://expense_receipt/<folder>/<file>"). The
@@ -97,6 +128,16 @@ router.get("/sign", async (req, res) => {
     // Already a usable non-Supabase URL — hand it straight back.
     if (ref.passthrough) {
       return res.json({ url: ref.passthrough, expiresIn: 0 });
+    }
+
+    if (access.isLegacy(req)) {
+      // No caller to check against (report mode): receipts bucket only.
+      if (ref.bucket !== DEFAULT_BUCKET) return access.deny(res, "You can't open that file.");
+    } else {
+      const owner = await receiptOwner(raw);
+      if (!owner || !(await access.canViewExpense(req, owner))) {
+        return access.deny(res, "You can't open that file.");
+      }
     }
 
     const signEndpoint = `${SUPABASE_URL}/storage/v1/object/sign/${encodeURIComponent(

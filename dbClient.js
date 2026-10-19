@@ -21,7 +21,8 @@ if (process.env.DATABASE_URL.includes("REPLACE_WITH_DB_PASSWORD")) {
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false },
+  // PGSSLMODE=disable for a local Postgres without TLS; Supabase always uses it.
+  ssl: process.env.PGSSLMODE === "disable" ? false : { rejectUnauthorized: false },
   max: 10,
   idleTimeoutMillis: 30_000,
   connectionTimeoutMillis: 10_000,

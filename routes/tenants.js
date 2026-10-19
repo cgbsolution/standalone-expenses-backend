@@ -15,6 +15,7 @@ const express = require("express");
 const pool = require("../dbClient");
 const { safeNotify } = require("../notifier");
 const { createResetToken, buildResetUrl, INVITE_TTL_HOURS } = require("../utils/passwordTokens");
+const access = require("../middleware/auth");
 
 const router = express.Router();
 
@@ -32,7 +33,8 @@ const VALID_PLANS = new Set(Object.keys(PLAN_MRR));
  *     responses:
  *       200: { description: Array of tenants }
  */
-router.get("/", async (_req, res) => {
+router.get("/", async (req, res) => {
+  if (!access.requireSuper(req)) return access.deny(res);
   try {
     const { rows } = await pool.query(`
       WITH t AS (
@@ -111,6 +113,7 @@ router.get("/", async (_req, res) => {
  *     tags: [Tenants]
  */
 router.get("/:slug", async (req, res) => {
+  if (!access.canReadTenant(req, req.params.slug)) return access.deny(res);
   try {
     const { rows } = await pool.query(
       `SELECT
@@ -182,6 +185,7 @@ function prettyName(slug) {
  *       409: { description: Subdomain or admin email already in use }
  */
 router.post("/", async (req, res) => {
+  if (!access.requireSuper(req)) return access.deny(res);
   const body = req.body || {};
   const name = String(body.name || "").trim();
   const adminName = String(body.adminName || "").trim();
@@ -322,6 +326,7 @@ const VALID_STATUSES = new Set(["active", "trialing", "suspended", "churned"]);
  *       404: { description: Tenant not found }
  */
 router.patch("/:slug", async (req, res) => {
+  if (!access.requireSuper(req)) return access.deny(res);
   const slug = String(req.params.slug || "").toLowerCase();
   const { status, plan } = req.body || {};
 

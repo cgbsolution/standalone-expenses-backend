@@ -7,8 +7,29 @@
 
 const express = require("express");
 const pool = require("../dbClient");
+const access = require("../middleware/auth");
 
 const router = express.Router();
+
+// The tenant a row belongs to, or null when there is no such row.
+async function ownerSlug(id) {
+  const { rows } = await pool.query(`SELECT slug FROM approval_rules WHERE id = $1`, [id]);
+  return rows[0] ? rows[0].slug : null;
+}
+
+// 404 when missing, 403 when it belongs to a tenant the caller can't administer.
+async function guardRow(req, res) {
+  const slug = await ownerSlug(req.params.id);
+  if (slug === null) {
+    res.status(404).json({ error: "Not found" });
+    return false;
+  }
+  if (!access.canAdminTenant(req, slug)) {
+    access.deny(res);
+    return false;
+  }
+  return true;
+}
 
 function shape(r) {
   return {
@@ -26,6 +47,7 @@ function shape(r) {
 router.get("/", async (req, res) => {
   const { slug } = req.query;
   if (!slug) return res.status(400).json({ error: "slug is required" });
+  if (!access.canAdminTenant(req, slug)) return access.deny(res);
   try {
     const { rows } = await pool.query(
       `SELECT * FROM approval_rules WHERE slug = $1 ORDER BY priority ASC, created_at ASC`,
@@ -41,6 +63,7 @@ router.get("/", async (req, res) => {
 router.post("/", async (req, res) => {
   const { slug, name, enabled, priority, conditions, action } = req.body || {};
   if (!slug || !name) return res.status(400).json({ error: "slug and name are required" });
+  if (!access.canAdminTenant(req, slug)) return access.deny(res);
   try {
     const { rows } = await pool.query(
       `INSERT INTO approval_rules (slug, name, enabled, priority, conditions, action)
@@ -57,6 +80,7 @@ router.post("/", async (req, res) => {
 router.put("/:id", async (req, res) => {
   const { name, enabled, priority, conditions, action } = req.body || {};
   try {
+    if (!(await guardRow(req, res))) return;
     const { rows } = await pool.query(
       `UPDATE approval_rules
           SET name = COALESCE($2, name),
@@ -84,6 +108,7 @@ router.put("/:id", async (req, res) => {
 
 router.delete("/:id", async (req, res) => {
   try {
+    if (!(await guardRow(req, res))) return;
     const { rowCount } = await pool.query(`DELETE FROM approval_rules WHERE id = $1`, [req.params.id]);
     if (!rowCount) return res.status(404).json({ error: "Not found" });
     return res.json({ deleted: true });

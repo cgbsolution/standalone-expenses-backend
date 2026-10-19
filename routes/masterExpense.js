@@ -2,8 +2,37 @@ const express = require("express");
 const { v4: uuidv4 } = require("uuid");
 const pool = require("../dbClient");
 const { safeNotify, pickEventForStatusChange, recordInAppNotification } = require("../notifier");
+const access = require("../middleware/auth");
 
 const router = express.Router();
+
+// A new expense is either parked as a draft or sent for approval — never born approved.
+function initialStatus(requested) {
+  return /^draft$/i.test(String(requested || "").trim()) ? "Draft" : "Pending";
+}
+
+// Who approves a new expense: the submitter's manager on record. Only when no
+// manager is on record does the client's choice count, and then it must be
+// someone else in the submitter's tenant.
+async function resolveApprover(submitterEmail, requested) {
+  const submitter = await pool.query(
+    `SELECT manager_email, tenant FROM employees WHERE LOWER(email) = LOWER($1) LIMIT 1`,
+    [submitterEmail],
+  );
+  const row = submitter.rows[0];
+  if (!row) return { error: "Your employee record was not found." };
+  if (row.manager_email && !access.sameEmail(row.manager_email, submitterEmail)) {
+    return { approver: row.manager_email };
+  }
+  if (!requested || access.sameEmail(requested, submitterEmail)) {
+    return { error: "No approver is set for you. Ask your admin to set your manager." };
+  }
+  const approver = await access.employeeByEmail(requested);
+  if (!approver || approver.tenant !== row.tenant) {
+    return { error: "The approver must be someone in your organisation." };
+  }
+  return { approver: approver.email };
+}
 
 // Fields that live in flat columns. Anything else in the incoming JSON gets
 // stuffed into the `data` JSONB column. Keep this list in sync with the
@@ -108,10 +137,21 @@ function rowToShape(row) {
  */
 router.post("/", async (req, res) => {
   try {
-    const { ExpenseTitle, ApproverEmail, SubmitterEmail, ApprovalStatus, ExpenseData } = req.body;
+    const { ExpenseTitle, ApprovalStatus, ExpenseData } = req.body;
+    let { ApproverEmail, SubmitterEmail } = req.body;
 
     if (!ExpenseTitle || !ApproverEmail || !SubmitterEmail || !ApprovalStatus || !Array.isArray(ExpenseData)) {
       return res.status(400).json({ error: "Invalid request payload" });
+    }
+
+    if (req.auth) {
+      if (!access.sameEmail(SubmitterEmail, req.auth.email)) {
+        return access.deny(res, "You can only submit your own expenses.");
+      }
+      SubmitterEmail = req.auth.email;
+      const routed = await resolveApprover(SubmitterEmail, ApproverEmail);
+      if (routed.error) return res.status(400).json({ error: routed.error });
+      ApproverEmail = routed.approver;
     }
 
     const enrichedData = ExpenseData.map(enrichInvoice);
@@ -125,6 +165,9 @@ router.post("/", async (req, res) => {
 
     const enrichedPayload = {
       ...req.body,
+      SubmitterEmail,
+      ApproverEmail,
+      ApprovalStatus: initialStatus(ApprovalStatus),
       ExpenseData: enrichedData,
       SubmissionDate: submissionDate,
       TotalAmount: totalAmount,
@@ -133,7 +176,7 @@ router.post("/", async (req, res) => {
           at: submissionDate,
           by: SubmitterEmail,
           from: "Start",
-          to: "Pending",
+          to: initialStatus(ApprovalStatus),
           comments: "Expense submitted and parked successfully",
         },
       ],
@@ -200,6 +243,7 @@ router.get("/", async (req, res) => {
   if (!email) return res.status(400).json({ error: "Email is required" });
 
   try {
+    if (!(await access.canActFor(req, email))) return access.deny(res);
     let result;
     if (!approvalStatus || approvalStatus === "All") {
       result = await pool.query(
@@ -244,6 +288,7 @@ router.get("/approver", async (req, res) => {
   if (!email) return res.status(400).json({ error: "Email is required" });
 
   try {
+    if (!(await access.canActFor(req, email))) return access.deny(res);
     const { rows } = await pool.query(
       `SELECT * FROM expenses
        WHERE approver_email = $1
@@ -277,6 +322,7 @@ router.get("/approver", async (req, res) => {
 router.get("/tenant", async (req, res) => {
   const { slug } = req.query;
   if (!slug) return res.status(400).json({ error: "slug is required" });
+  if (!access.canAdminTenant(req, slug)) return access.deny(res);
 
   try {
     const { rows } = await pool.query(
@@ -320,6 +366,7 @@ router.get("/tenant", async (req, res) => {
  *       500: { description: Failed to fetch expenses }
  */
 router.get("/all", async (req, res) => {
+  if (!access.requireSuper(req)) return access.deny(res);
   const { status, limit } = req.query;
   const lim = Math.min(Math.max(Number(limit) || 500, 1), 2000);
   try {
@@ -371,6 +418,7 @@ router.get("/counts", async (req, res) => {
   if (!email) return res.status(400).json({ error: "Email is required" });
 
   try {
+    if (!(await access.canActFor(req, email))) return access.deny(res);
     const column = role === "approver" ? "approver_email" : "submitter_email";
     const { rows } = await pool.query(
       `SELECT approval_status AS status, COUNT(*)::int AS count
@@ -419,6 +467,7 @@ router.get("/non-self-approve", async (req, res) => {
   if (!email) return res.status(400).json({ error: "Email is required" });
 
   try {
+    if (!(await access.canActFor(req, email))) return access.deny(res);
     const { rows } = await pool.query(
       `SELECT * FROM expenses
        WHERE approver_email = $1
@@ -633,16 +682,58 @@ async function updateStatus(id, body) {
  *       404: { description: Expense not found }
  *       500: { description: Failed to update expense }
  */
-router.put("/:id", async (req, res) => {
+const STATUSES = new Set(["Approved", "Rejected", "Pending", "Draft"]);
+
+// Who may move an expense to which status:
+//   Approved / Rejected — the current approver or a tenant admin, while it is pending.
+//   Pending / Draft     — the submitter, to (re)submit a draft or a rejected expense.
+async function authoriseStatusChange(req, id, requested) {
+  if (!STATUSES.has(requested)) {
+    return { status: 400, error: "ApprovalStatus must be Approved, Rejected, Pending or Draft" };
+  }
+  const { rows } = await pool.query(`SELECT * FROM expenses WHERE id = $1`, [id]);
+  const row = rows[0];
+  if (!row) return { status: 404, error: "Expense not found" };
+  if (access.isLegacy(req)) return null;
+
+  const current = String(row.approval_status || "Pending");
+  if (requested === "Approved" || requested === "Rejected") {
+    if (!(await access.canDecideExpense(req, row))) {
+      return { status: 403, error: "Only the current approver or a tenant admin can decide this expense." };
+    }
+    if (!/^pending/i.test(current)) {
+      return { status: 409, error: "This expense is no longer awaiting approval." };
+    }
+    return null;
+  }
+
+  if (!access.sameEmail(req.auth.email, row.submitter_email)) {
+    return { status: 403, error: "Only the person who submitted this expense can do that." };
+  }
+  const allowedFrom = requested === "Pending" ? /^(draft|rejected)$/i : /^draft$/i;
+  if (!allowedFrom.test(current)) {
+    return { status: 409, error: `An expense that is ${current} can't be moved to ${requested}.` };
+  }
+  return null;
+}
+
+async function handleStatusUpdate(req, res, failure) {
   try {
-    const updated = await updateStatus(req.params.id, req.body);
+    const problem = await authoriseStatusChange(req, req.params.id, req.body?.ApprovalStatus);
+    if (problem) return res.status(problem.status).json({ error: problem.error });
+    const updated = await updateStatus(req.params.id, {
+      ...req.body,
+      UpdatedBy: access.actorEmail(req, req.body?.UpdatedBy),
+    });
     return res.json(updated);
   } catch (error) {
     const status = error.status || 500;
-    if (status === 500) console.error("Error updating status:", error);
-    return res.status(status).json({ error: error.message || "Failed to update expense status." });
+    if (status === 500) console.error(`${failure}:`, error);
+    return res.status(status).json({ error: error.message || `${failure}.` });
   }
-});
+}
+
+router.put("/:id", (req, res) => handleStatusUpdate(req, res, "Failed to update expense status"));
 
 /**
  * @swagger
@@ -671,16 +762,7 @@ router.put("/:id", async (req, res) => {
  *       400: { description: ApprovalStatus is required or invalid }
  *       404: { description: Not found }
  */
-router.put("/by-id/:id", async (req, res) => {
-  try {
-    const updated = await updateStatus(req.params.id, req.body);
-    return res.json(updated);
-  } catch (error) {
-    const status = error.status || 500;
-    if (status === 500) console.error("Error updating ApprovalStatus:", error);
-    return res.status(status).json({ error: error.message || "Failed to update ApprovalStatus." });
-  }
-});
+router.put("/by-id/:id", (req, res) => handleStatusUpdate(req, res, "Failed to update ApprovalStatus"));
 
 /* ------------------------------------------------------------------ *
  * Manual payment marking
@@ -695,19 +777,8 @@ router.put("/by-id/:id", async (req, res) => {
  * ------------------------------------------------------------------ */
 
 // Which tenant does this expense belong to? Expenses have no tenant column, so
-// resolve it the same way GET /tenant does — through the people on the record.
-// Submitter first (they're the one whose policy applies), approver as fallback.
-async function resolveExpenseTenant(row) {
-  const candidates = [row.submitter_email, row.approver_email].filter(Boolean);
-  for (const email of candidates) {
-    const { rows } = await pool.query(
-      `SELECT tenant FROM employees WHERE LOWER(email) = LOWER($1) LIMIT 1`,
-      [email],
-    );
-    if (rows[0]?.tenant) return rows[0].tenant;
-  }
-  return "";
-}
+// resolve it through the people on the record — submitter first, approver as fallback.
+const resolveExpenseTenant = access.expenseTenant;
 
 async function isManualPaymentEnabled(slug) {
   if (!slug) return false;
@@ -774,8 +845,10 @@ async function canMarkPaid(actorEmail, row, slug) {
  */
 router.post("/:id/payment", async (req, res) => {
   const { id } = req.params;
-  const { UpdatedBy, PaymentReference, PaymentDate, PaymentNote } = req.body || {};
+  const { PaymentReference, PaymentDate, PaymentNote } = req.body || {};
   const paid = req.body?.Paid !== false; // default true
+  // The signed-in caller; only a token-less request (report mode) names itself.
+  const UpdatedBy = access.actorEmail(req, req.body?.UpdatedBy);
 
   if (!UpdatedBy) {
     return res.status(400).json({ error: "UpdatedBy is required" });
@@ -946,11 +1019,42 @@ async function lookupManagerEmail(submitterEmail) {
   }
 }
 
+const NOTIFY_EVENTS = new Set([
+  "expense.submitted",
+  "expense.resubmitted",
+  "expense.approved",
+  "expense.rejected",
+]);
+
 router.post("/notify", async (req, res) => {
   try {
-    const { eventType, expense, recipient } = req.body || {};
-    if (!eventType || !expense) {
+    const { eventType, recipient } = req.body || {};
+    const claimed = req.body?.expense;
+    if (!eventType || !claimed) {
       return res.status(400).json({ error: "eventType and expense are required" });
+    }
+    if (!NOTIFY_EVENTS.has(eventType)) {
+      return res.status(400).json({ error: "Unknown eventType" });
+    }
+
+    // The email is built from the stored expense, never from what the caller
+    // sent, and goes only to someone on that expense — so this endpoint can't
+    // be used to send arbitrary mail.
+    const lookupId = claimed.id || claimed.ExpenseId;
+    if (!lookupId) return res.status(400).json({ error: "expense.id is required" });
+    const { rows: stored } = await pool.query(
+      `SELECT * FROM expenses WHERE id = $1 OR unique_key = $1 LIMIT 1`,
+      [String(lookupId)],
+    );
+    if (!stored.length) return res.status(404).json({ error: "Expense not found" });
+    if (!(await access.canViewExpense(req, stored[0]))) return access.deny(res);
+    const expense = rowToShape(stored[0]);
+    if (recipient) {
+      const manager = await lookupManagerEmail(expense.SubmitterEmail);
+      const onRecord = [expense.SubmitterEmail, expense.ApproverEmail, manager];
+      if (!onRecord.some((email) => access.sameEmail(email, recipient))) {
+        return res.status(400).json({ error: "recipient must be the submitter or an approver of this expense" });
+      }
     }
 
     let to = recipient || "";

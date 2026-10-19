@@ -10,8 +10,28 @@
 
 const express = require("express");
 const pool = require("../dbClient");
+const access = require("../middleware/auth");
+const { checkTestTarget } = require("../utils/safeUrl");
 
 const router = express.Router();
+
+// What a non-admin in the tenant sees: enough for the mobile app to code an
+// expense for SAP, nothing about how we connect to it.
+function memberView(masked) {
+  const { sap, hrms } = masked;
+  return {
+    ...masked,
+    sap: {
+      enabled: sap.enabled,
+      baseUrl: sap.baseUrl,
+      companyCode: sap.companyCode,
+      glAccount: sap.glAccount,
+      costCenter: sap.costCenter,
+      taxCode: sap.taxCode,
+    },
+    hrms: { enabled: hrms.enabled },
+  };
+}
 
 // Whitelisted fields per provider. `secret: true` marks a write-only field.
 const SAP_FIELDS = [
@@ -103,14 +123,16 @@ async function loadRow(slug) {
  *       200: { description: Integration config }
  */
 router.get("/:slug", async (req, res) => {
+  if (!access.canReadTenant(req, req.params.slug)) return access.deny(res);
   try {
     const row = await loadRow(req.params.slug);
-    return res.json({
+    const masked = {
       slug: req.params.slug,
       sap: maskProvider(row?.sap, SAP_FIELDS),
       hrms: maskProvider(row?.hrms, HRMS_FIELDS),
       updatedAt: row?.updated_at || null,
-    });
+    };
+    return res.json(access.canAdminTenant(req, req.params.slug) ? masked : memberView(masked));
   } catch (error) {
     console.error("Error fetching integrations:", error);
     return res.status(500).json({ error: "Failed to fetch integrations." });
@@ -143,6 +165,7 @@ router.get("/:slug", async (req, res) => {
 router.put("/:slug", async (req, res) => {
   const slug = req.params.slug;
   if (!slug) return res.status(400).json({ error: "slug is required" });
+  if (!access.canAdminTenant(req, slug)) return access.deny(res);
   try {
     const existing = await loadRow(slug);
     const sap = mergeProvider(existing?.sap, req.body?.sap, SAP_FIELDS);
@@ -191,6 +214,7 @@ router.post("/:slug/:type/test", async (req, res) => {
   const { slug, type } = req.params;
   const fields = FIELDS_BY_TYPE[type];
   if (!fields) return res.status(400).json({ error: "type must be 'sap' or 'hrms'" });
+  if (!access.canAdminTenant(req, slug)) return access.deny(res);
 
   try {
     const row = await loadRow(slug);
@@ -202,12 +226,16 @@ router.post("/:slug/:type/test", async (req, res) => {
     if (!/^https?:\/\//i.test(baseUrl)) {
       return res.json({ ok: false, message: "Endpoint must start with http(s)://" });
     }
+    const refused = await checkTestTarget(baseUrl);
+    if (refused) return res.json({ ok: false, message: refused });
 
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), 8000);
     try {
       const started = Date.now();
-      const resp = await fetch(baseUrl, { method: "GET", signal: ctrl.signal });
+      // No redirects: a 3xx already proves the host answers, and following one
+      // could lead somewhere checkTestTarget never saw.
+      const resp = await fetch(baseUrl, { method: "GET", signal: ctrl.signal, redirect: "manual" });
       clearTimeout(timer);
       // Any HTTP response (even 401/404) means the host is reachable.
       return res.json({

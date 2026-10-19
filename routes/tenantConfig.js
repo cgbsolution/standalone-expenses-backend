@@ -5,6 +5,7 @@
 
 const express = require("express");
 const pool = require("../dbClient");
+const access = require("../middleware/auth");
 
 const router = express.Router();
 
@@ -30,8 +31,12 @@ const DEFAULTS = {
 };
 
 const ALLOWED = Object.keys(DEFAULTS);
+// Only a super-admin changes these; a tenant admin's save leaves them as they are.
+const SUPER_ONLY = new Set(["manualPaymentEnabled", "noPolicyMode"]);
 
 router.get("/:slug", async (req, res) => {
+  // Everyone in the tenant reads it (the mobile app needs currency, limits, payment mode).
+  if (!access.canReadTenant(req, req.params.slug)) return access.deny(res);
   try {
     const { rows } = await pool.query(
       `SELECT config, updated_at FROM tenant_config WHERE slug = $1`,
@@ -49,9 +54,15 @@ router.get("/:slug", async (req, res) => {
 });
 
 router.put("/:slug", async (req, res) => {
+  if (!access.canAdminTenant(req, req.params.slug)) return access.deny(res);
   const incoming = req.body?.config || req.body || {};
+  const mayChangeSuperOnly = !req.auth || access.isSuper(req);
   const clean = {};
-  for (const k of ALLOWED) if (k in incoming) clean[k] = incoming[k];
+  for (const k of ALLOWED) {
+    if (!(k in incoming)) continue;
+    if (SUPER_ONLY.has(k) && !mayChangeSuperOnly) continue;
+    clean[k] = incoming[k];
+  }
   try {
     const { rows } = await pool.query(
       `INSERT INTO tenant_config (slug, config, updated_at)

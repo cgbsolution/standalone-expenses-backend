@@ -6,8 +6,29 @@
 
 const express = require("express");
 const pool = require("../dbClient");
+const access = require("../middleware/auth");
 
 const router = express.Router();
+
+// The tenant a row belongs to, or null when there is no such row.
+async function ownerSlug(id) {
+  const { rows } = await pool.query(`SELECT slug FROM expense_categories WHERE id = $1`, [id]);
+  return rows[0] ? rows[0].slug : null;
+}
+
+// 404 when missing, 403 when it belongs to a tenant the caller can't administer.
+async function guardRow(req, res) {
+  const slug = await ownerSlug(req.params.id);
+  if (slug === null) {
+    res.status(404).json({ error: "Not found" });
+    return false;
+  }
+  if (!access.canAdminTenant(req, slug)) {
+    access.deny(res);
+    return false;
+  }
+  return true;
+}
 
 function shape(r) {
   return {
@@ -31,6 +52,8 @@ function shape(r) {
 router.get("/", async (req, res) => {
   const { slug } = req.query;
   if (!slug) return res.status(400).json({ error: "slug is required" });
+  // Everyone in the tenant picks from these when filing an expense.
+  if (!access.canReadTenant(req, slug)) return access.deny(res);
   try {
     const { rows } = await pool.query(
       `SELECT * FROM expense_categories WHERE slug = $1 ORDER BY name ASC`,
@@ -46,6 +69,7 @@ router.get("/", async (req, res) => {
 router.post("/", async (req, res) => {
   const { slug, name, color, icon, monthlyBudget, glAccount, glProject, glCrm } = req.body || {};
   if (!slug || !name) return res.status(400).json({ error: "slug and name are required" });
+  if (!access.canAdminTenant(req, slug)) return access.deny(res);
   try {
     const { rows } = await pool.query(
       `INSERT INTO expense_categories
@@ -64,6 +88,7 @@ router.post("/", async (req, res) => {
 router.put("/:id", async (req, res) => {
   const { name, color, icon, monthlyBudget, glAccount, glProject, glCrm } = req.body || {};
   try {
+    if (!(await guardRow(req, res))) return;
     const { rows } = await pool.query(
       `UPDATE expense_categories
           SET name = COALESCE($2, name),
@@ -95,6 +120,7 @@ router.put("/:id", async (req, res) => {
 
 router.delete("/:id", async (req, res) => {
   try {
+    if (!(await guardRow(req, res))) return;
     const { rowCount } = await pool.query(`DELETE FROM expense_categories WHERE id = $1`, [req.params.id]);
     if (!rowCount) return res.status(404).json({ error: "Not found" });
     return res.json({ deleted: true });

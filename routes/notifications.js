@@ -1,7 +1,15 @@
 const express = require("express");
 const pool = require("../dbClient");
+const access = require("../middleware/auth");
 
 const router = express.Router();
+
+// Notifications are personal: only their recipient reads or marks them. With
+// a token the recipient is the caller; only a token-less request (report mode)
+// names one.
+function recipientOf(req, claimed) {
+  return req.auth ? req.auth.email : claimed;
+}
 
 // Map a DB row to the shape the mobile app expects.
 function rowToShape(row) {
@@ -47,7 +55,8 @@ function rowToShape(row) {
  *       500: { description: Failed to fetch notifications }
  */
 router.get("/", async (req, res) => {
-  const { email, status, limit } = req.query;
+  const { status, limit } = req.query;
+  const email = recipientOf(req, req.query.email);
   if (!email) return res.status(400).json({ error: "email is required" });
 
   const lim = Math.min(Math.max(Number(limit) || 100, 1), 200);
@@ -84,7 +93,7 @@ router.get("/", async (req, res) => {
  *       400: { description: email is required }
  */
 router.get("/unread-count", async (req, res) => {
-  const { email } = req.query;
+  const email = recipientOf(req, req.query.email);
   if (!email) return res.status(400).json({ error: "email is required" });
   try {
     const { rows } = await pool.query(
@@ -120,7 +129,7 @@ router.get("/unread-count", async (req, res) => {
  *       400: { description: email is required }
  */
 router.put("/read-all", async (req, res) => {
-  const email = req.body?.email;
+  const email = recipientOf(req, req.body?.email);
   if (!email) return res.status(400).json({ error: "email is required" });
   try {
     const { rowCount } = await pool.query(
@@ -153,10 +162,15 @@ router.put("/read-all", async (req, res) => {
  */
 router.put("/:id/read", async (req, res) => {
   try {
-    const { rows } = await pool.query(
-      `UPDATE notifications SET read = TRUE WHERE id = $1 RETURNING *`,
-      [req.params.id]
-    );
+    const { rows } = req.auth
+      ? await pool.query(
+          `UPDATE notifications SET read = TRUE
+            WHERE id = $1 AND LOWER(recipient_email) = LOWER($2) RETURNING *`,
+          [req.params.id, req.auth.email]
+        )
+      : await pool.query(`UPDATE notifications SET read = TRUE WHERE id = $1 RETURNING *`, [
+          req.params.id,
+        ]);
     if (!rows.length) return res.status(404).json({ error: "Notification not found" });
     return res.json(rowToShape(rows[0]));
   } catch (error) {

@@ -6,11 +6,34 @@ const swaggerUi = require("swagger-ui-express");
 
 dotenv.config();
 
-const app = express();
+const { authenticate } = require("./middleware/auth");
 
-app.use(cors());
-app.use(express.json({ limit: "25mb" }));
+const app = express();
+app.disable("x-powered-by");
+
+// Browsers may call the API only from these origins (the dashboard). The mobile
+// app is not a browser and is unaffected. Unset = any origin, with a warning.
+const corsOrigins = String(process.env.CORS_ORIGINS || "")
+  .split(",")
+  .map((o) => o.trim().replace(/\/+$/, ""))
+  .filter(Boolean);
+if (!corsOrigins.length) {
+  console.warn("[cors] CORS_ORIGINS is not set — any website may call this API from a browser.");
+}
+app.use(cors(corsOrigins.length ? { origin: corsOrigins } : undefined));
+// Keep the exact bytes too: AskMira's calls are signed over the raw body.
+app.use(
+  express.json({
+    limit: "25mb",
+    verify: (req, _res, buf) => {
+      req.rawBody = buf;
+    },
+  }),
+);
 app.use(express.urlencoded({ limit: "25mb", extended: true }));
+
+// Every route below needs a signed-in caller unless listed public in middleware/auth.js.
+app.use(authenticate);
 
 const swaggerOptions = {
   definition: {
@@ -31,6 +54,12 @@ const swaggerOptions = {
 
 const swaggerDocs = swaggerJsDoc(swaggerOptions);
 app.use("/api-docs", swaggerUi.serve, swaggerUi.setup(swaggerDocs));
+
+// AskMira (HRMS) link — mounted first so /integrations/:slug never shadows it.
+// Off unless ASKMIRA_SHARED_SECRET is set. See routes/askmira.js.
+const askmira = require("./routes/askmira");
+app.use("/integrations/askmira", askmira.integrationRouter);
+app.use("/auth/askmira", askmira.authRouter);
 
 const masterExpenseRoute = require("./routes/masterExpense");
 app.use("/master-expense", masterExpenseRoute);
@@ -84,6 +113,25 @@ async function ensureSchema() {
     // Self-service profile fields set from the mobile app / dashboard profile page.
     await pool.query(`ALTER TABLE employees ADD COLUMN IF NOT EXISTS avatar_url TEXT`);
     await pool.query(`ALTER TABLE employees ADD COLUMN IF NOT EXISTS integration_provider TEXT`);
+    // Tokens issued before this moment are refused (set on password reset).
+    await pool.query(`ALTER TABLE employees ADD COLUMN IF NOT EXISTS auth_valid_after TIMESTAMPTZ`);
+    // AskMira link: which employees AskMira manages, and who it has switched off.
+    await pool.query(`ALTER TABLE employees ADD COLUMN IF NOT EXISTS askmira_user_id TEXT`);
+    await pool.query(`ALTER TABLE employees ADD COLUMN IF NOT EXISTS deactivated_at TIMESTAMPTZ`);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS askmira_links (
+        askmira_tenant_id TEXT PRIMARY KEY,
+        slug TEXT NOT NULL UNIQUE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+    // One-time AskMira sign-in links that have been used.
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS askmira_launches (
+        jti TEXT PRIMARY KEY,
+        expires_at TIMESTAMPTZ NOT NULL
+      )
+    `);
     await ensurePasswordResetTable();
 
     // In-app notifications. One row per workflow event (submitted / approved /
