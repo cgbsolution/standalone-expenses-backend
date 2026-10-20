@@ -1,0 +1,42 @@
+# Checks every push and pull request: the whole test suite against a real
+# Postgres. Deploying stays in main_expense-backend-node.yml, which also runs
+# `npm test` (without a database, so only the "every route needs a token" test).
+
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: ci
+          POSTGRES_PASSWORD: ci
+          POSTGRES_DB: expgenie_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20.x"
+          cache: npm
+      - run: npm ci
+      - name: Syntax check
+        run: node --check index.js && node --check app.js && for f in routes/*.js middleware/*.js utils/*.js; do node --check "$f"; done
+      - name: Tests
+        run: npm test
+        env:
+          TEST_DATABASE_URL: postgres://ci:ci@localhost:5432/expgenie_test

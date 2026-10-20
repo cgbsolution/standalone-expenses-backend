@@ -269,6 +269,7 @@ function deny(res, message = "You don't have access to that.") {
 
 module.exports = {
   authenticate,
+  isPublic,
   issueToken,
   isTenantBlocked,
   SUSPENDED_MESSAGE,
