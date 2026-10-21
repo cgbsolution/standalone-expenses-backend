@@ -4,12 +4,18 @@
 // here server to server to create (or adopt) the tenant and to send who should
 // have access, and it sends people here already signed in with a one-time link.
 //
-// Every request carries a short-lived HS256 token signed with
-// ASKMIRA_SHARED_SECRET (aud "askmira:expense", iss "askmira"):
+// Each AskMira workspace connects to one tenant here, started by its admin in
+// AskMira and allowed by an admin of the tenant here ("Connecting" below); the
+// connection has its own secret, which reaches that tenant only. Every request
+// carries a short-lived HS256 token signed with that secret (aud
+// "askmira:expense", iss "askmira"), or, for a workspace linked the older way,
+// with ASKMIRA_SHARED_SECRET:
 //
 //   POST /integrations/askmira/organizations   use=provision, `bh` = SHA-256 of the body
 //   POST /integrations/askmira/users/sync      use=provision, `bh` = SHA-256 of the body
 //   POST /integrations/askmira/query           use=query, `bh` = SHA-256 of the body
+//   POST /integrations/askmira/connect/token   AskMira's server swaps a one-time code (PKCE)
+//   POST /integrations/askmira/connect/revoke  use=revoke, `bh`; AskMira disconnected
 //   POST /auth/askmira/exchange                use=launch; each `jti` is accepted once
 //
 // `query` is read-only: AskMira's companion asks it on behalf of one person
@@ -21,7 +27,7 @@
 
 const crypto = require("crypto");
 const express = require("express");
-const { jwtVerify } = require("jose");
+const { decodeJwt, jwtVerify } = require("jose");
 const pool = require("../dbClient");
 const { signedIn } = require("./auth");
 const { normEmail } = require("../middleware/auth");
@@ -33,6 +39,7 @@ const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 const integrationRouter = express.Router();
 const authRouter = express.Router();
+const connectionRouter = express.Router();
 
 function httpError(status, message) {
   const err = new Error(message);
@@ -40,15 +47,53 @@ function httpError(status, message) {
   return err;
 }
 
-function secretKey() {
-  const secret = process.env.ASKMIRA_SHARED_SECRET || "";
+// ── Token checks ─────────────────────────────────────────────────────────────
+//
+// A token is checked with the secret of the workspace it names — `sub` on
+// server-to-server calls, `tid` on a sign-in link — so one workspace's secret
+// can never act for another. A workspace that has not connected from AskMira's
+// Connectors falls back to ASKMIRA_SHARED_SECRET; with neither, the endpoints
+// behave as if they did not exist.
+
+function serverKey() {
+  return process.env.AUTH_JWT_SECRET || "";
+}
+
+// A tenant's AskMira secret: derived, so the database holds only the nonce.
+function derive(slug, nonce) {
+  return crypto.createHmac("sha256", serverKey()).update(`askmira-org:v1:${slug}:${nonce}`).digest("hex");
+}
+
+async function tenantSecret(tenantId) {
+  if (!tenantId) return null;
+  try {
+    const { rows } = await pool.query(
+      `SELECT slug, secret_nonce FROM askmira_links WHERE askmira_tenant_id = $1 AND secret_nonce IS NOT NULL`,
+      [tenantId],
+    );
+    return rows[0] ? derive(rows[0].slug, rows[0].secret_nonce) : null;
+  } catch {
+    return null; // before the columns exist: no connections made here
+  }
+}
+
+async function secretKey(tenantId) {
+  const secret = (await tenantSecret(tenantId)) || process.env.ASKMIRA_SHARED_SECRET || "";
   // Off (or misconfigured): behave as if the endpoints did not exist.
   if (secret.length < 32) throw httpError(404, "Route not found");
   return new TextEncoder().encode(secret);
 }
 
 async function claimsOf(token, use) {
-  const key = secretKey();
+  let unverified;
+  try {
+    unverified = decodeJwt(token);
+  } catch {
+    await secretKey(""); // names no workspace: as if absent unless the older link is on
+    throw httpError(401, "This AskMira link is not valid or has expired.");
+  }
+  // Whose secret to check with: the workspace the token is for.
+  const key = await secretKey(String((use === "launch" ? unverified.tid : unverified.sub) || ""));
   let payload;
   try {
     ({ payload } = await jwtVerify(token, key, {
@@ -67,7 +112,7 @@ async function claimsOf(token, use) {
 async function provisionClaims(req, use = "provision") {
   const match = /^Bearer\s+(.+)$/i.exec(req.get("authorization") || "");
   if (!match) {
-    secretKey();
+    await secretKey(String(req.body?.tenant_id || "")); // as if absent where the link is off
     throw httpError(401, "Missing AskMira assertion.");
   }
   const claims = await claimsOf(match[1].trim(), use);
@@ -555,4 +600,199 @@ authRouter.post("/exchange", async (req, res) => {
   }
 });
 
-module.exports = { integrationRouter, authRouter };
+// ── Connecting (from AskMira, by an admin of this tenant) ───────────────────
+//
+// Like "Sign in with…": an admin of a workspace in AskMira presses Connect
+// there, lands on the dashboard's /connect/askmira, signs in and presses Allow.
+// That makes a one-time code bound to their tenant and to a challenge only
+// AskMira's server can answer (PKCE); AskMira's server swaps code + verifier for
+// the tenant's own secret (/connect/token). The secret reaches only that one
+// tenant's records, and either side can disconnect.
+
+const CODE_LIFETIME_MS = 5 * 60 * 1000;
+const CALLBACK_PATH = "/settings/connectors/callback";
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const PKCE_RE = /^[A-Za-z0-9_-]{43,128}$/;
+
+const sha256 = (value) => crypto.createHash("sha256").update(value).digest("hex");
+
+function requireTenantAdmin(req) {
+  if (req.auth?.role !== "admin" || !req.auth.tenant) {
+    throw httpError(403, "Only an admin of a workspace connects it to AskMira.");
+  }
+  return req.auth.tenant;
+}
+
+// The AskMira that is asking, from where it wants the answer sent; refuses anything odd.
+function askmiraOrigin(redirectUri) {
+  let url;
+  try {
+    url = new URL(String(redirectUri || ""));
+  } catch {
+    throw httpError(422, "That is not an AskMira connect link.");
+  }
+  const local = ["localhost", "127.0.0.1"].includes(url.hostname);
+  if (
+    !["https:", "http:"].includes(url.protocol) ||
+    (url.protocol === "http:" && !local) ||
+    url.pathname.replace(/\/+$/, "") !== CALLBACK_PATH ||
+    url.search ||
+    url.hash
+  ) {
+    throw httpError(422, "That is not an AskMira connect link.");
+  }
+  const allowed = String(process.env.ASKMIRA_ALLOWED_ORIGINS || "")
+    .split(",")
+    .map((o) => o.trim().replace(/\/+$/, ""))
+    .filter(Boolean);
+  if (allowed.length && !allowed.includes(url.origin)) {
+    throw httpError(403, "This AskMira is not one this server connects to.");
+  }
+  return url.origin;
+}
+
+async function connectionRead(slug) {
+  const { rows } = await pool.query(
+    `SELECT askmira_name, askmira_origin, connected_at FROM askmira_links
+      WHERE slug = $1 AND secret_nonce IS NOT NULL`,
+    [slug],
+  );
+  const row = rows[0];
+  return {
+    tenant: slug,
+    connected: Boolean(row),
+    askmira_workspace: row?.askmira_name || null,
+    askmira_origin: row?.askmira_origin || null,
+    connected_at: row?.connected_at ? new Date(row.connected_at).toISOString() : null,
+  };
+}
+
+// Whether the caller's tenant is connected to an AskMira workspace, and which.
+connectionRouter.get(
+  "/",
+  handle(async (req) => connectionRead(requireTenantAdmin(req))),
+);
+
+// The admin pressed Allow: a one-time code for AskMira, bound to their tenant.
+connectionRouter.post(
+  "/approve",
+  handle(async (req) => {
+    const slug = requireTenantAdmin(req);
+    if (serverKey().length < 32) throw httpError(409, "Set a long AUTH_JWT_SECRET on this server first.");
+    const tenantId = String(req.body?.tenant_id || "").toLowerCase();
+    const challenge = String(req.body?.challenge || "");
+    const state = String(req.body?.state || "");
+    const name = clean(req.body?.tenant_name);
+    if (!UUID_RE.test(tenantId) || !PKCE_RE.test(challenge) || !state || state.length > 2000 || !name) {
+      throw httpError(422, "That is not an AskMira connect link.");
+    }
+    const origin = askmiraOrigin(req.body?.redirect_uri);
+    const { rows: links } = await pool.query(
+      `SELECT askmira_tenant_id, slug FROM askmira_links WHERE slug = $1 OR askmira_tenant_id = $2`,
+      [slug, tenantId],
+    );
+    if (links.some((l) => l.slug === slug && l.askmira_tenant_id !== tenantId)) {
+      throw httpError(409, "Your workspace is already connected to another AskMira workspace. Disconnect it first.");
+    }
+    if (links.some((l) => l.askmira_tenant_id === tenantId && l.slug !== slug)) {
+      throw httpError(409, "That AskMira workspace is already connected to another workspace here.");
+    }
+    const code = crypto.randomBytes(32).toString("base64url");
+    await pool.query(`DELETE FROM askmira_connect_codes WHERE expires_at < NOW()`);
+    await pool.query(
+      `INSERT INTO askmira_connect_codes
+         (code_hash, slug, askmira_tenant_id, askmira_name, askmira_origin, challenge, user_email, expires_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+      [sha256(code), slug, tenantId, name, origin, challenge, req.auth.email, new Date(Date.now() + CODE_LIFETIME_MS)],
+    );
+    console.log(`[AskMira] ${slug} approved a connection to workspace ${tenantId} at ${origin}`);
+    const query = new URLSearchParams({ code, state, product: "expense" });
+    return { redirect_to: `${String(req.body.redirect_uri).replace(/\/+$/, "")}?${query}` };
+  }),
+);
+
+// AskMira's server swaps the code (and the verifier only it holds) for the tenant's secret.
+integrationRouter.post(
+  "/connect/token",
+  handle(async (req) => {
+    const code = String(req.body?.code || "");
+    const verifier = String(req.body?.verifier || "");
+    const tenantId = String(req.body?.tenant_id || "").toLowerCase();
+    const refused = httpError(400, "This connect code is not valid or has expired.");
+    if (!code || code.length > 200 || !PKCE_RE.test(verifier)) throw refused;
+    // One use, whatever happens next.
+    const { rows } = await pool.query(
+      `UPDATE askmira_connect_codes SET used_at = NOW()
+        WHERE code_hash = $1 AND used_at IS NULL AND expires_at > NOW()
+        RETURNING *`,
+      [sha256(code)],
+    );
+    const row = rows[0];
+    if (!row) throw refused;
+    const challenge = crypto.createHash("sha256").update(verifier).digest("base64url");
+    if (
+      row.askmira_tenant_id !== tenantId ||
+      challenge.length !== row.challenge.length ||
+      !crypto.timingSafeEqual(Buffer.from(challenge), Buffer.from(row.challenge))
+    ) {
+      throw refused;
+    }
+    const nonce = crypto.randomBytes(32).toString("base64url");
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const { rows: clash } = await client.query(
+        `SELECT 1 FROM askmira_links WHERE (slug = $1) <> (askmira_tenant_id = $2)
+            AND (slug = $1 OR askmira_tenant_id = $2)`,
+        [row.slug, tenantId],
+      );
+      if (clash.length) throw httpError(409, "That AskMira workspace is already connected to another workspace here.");
+      await client.query(
+        `INSERT INTO askmira_links (askmira_tenant_id, slug, secret_nonce, askmira_name, askmira_origin, connected_at, connected_by)
+         VALUES ($1, $2, $3, $4, $5, NOW(), $6)
+         ON CONFLICT (askmira_tenant_id) DO UPDATE
+           SET secret_nonce = EXCLUDED.secret_nonce, askmira_name = EXCLUDED.askmira_name,
+               askmira_origin = EXCLUDED.askmira_origin, connected_at = NOW(), connected_by = EXCLUDED.connected_by`,
+        [tenantId, row.slug, nonce, row.askmira_name, row.askmira_origin, row.user_email],
+      );
+      await client.query("COMMIT");
+    } catch (err) {
+      await client.query("ROLLBACK");
+      throw err;
+    } finally {
+      client.release();
+    }
+    console.log(`[AskMira] ${row.slug} connected to workspace ${tenantId}`);
+    return {
+      product: "expense",
+      brand: "ExpenseGenie",
+      secret: derive(row.slug, nonce),
+      external_ref: row.slug,
+      organization: row.slug,
+    };
+  }),
+);
+
+// Disconnect from this side: AskMira's secret for this tenant stops working at once.
+connectionRouter.delete(
+  "/",
+  handle(async (req) => {
+    const slug = requireTenantAdmin(req);
+    await pool.query(`DELETE FROM askmira_links WHERE slug = $1`, [slug]);
+    console.log(`[AskMira] ${slug} disconnected by ${req.auth.email}`);
+    return connectionRead(slug);
+  }),
+);
+
+// AskMira disconnected: forget this workspace's secret here too.
+integrationRouter.post(
+  "/connect/revoke",
+  handle(async (req) => {
+    const claims = await provisionClaims(req, "revoke");
+    await pool.query(`DELETE FROM askmira_links WHERE askmira_tenant_id = $1`, [claims.sub]);
+    console.log(`[AskMira] workspace ${claims.sub} disconnected from AskMira`);
+    return { disconnected: true };
+  }),
+);
+
+module.exports = { integrationRouter, authRouter, connectionRouter };

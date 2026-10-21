@@ -323,3 +323,111 @@ describe("AskMira queries", { skip: SKIP }, () => {
     assert.equal((await ask("claims", rep, { scope: "everyone" })).status, 422);
   });
 });
+
+describe("AskMira Connectors: a workspace admin connects from AskMira", { skip: SKIP }, () => {
+  let db;
+  let api;
+  let adminToken;
+  let empToken;
+  let superToken;
+  const CALLBACK = "https://askmira.test/settings/connectors/callback";
+
+  before(async () => {
+    db = await resetDatabase();
+    await seedPeople(db, [
+      ["sa@platform.com", "SA", "super_admin", null],
+      ["admin@acme.com", "Acme Admin", "admin", "acme"],
+      ["emp@acme.com", "Acme Emp", "employee", "acme"],
+      ["admin@beta.com", "Beta Admin", "admin", "beta"],
+    ]);
+    await db.query(`INSERT INTO tenant_settings (slug, name, status) VALUES ('acme','Acme','active'), ('beta','Beta','active')`);
+    api = await startApi(); // no ASKMIRA_SHARED_SECRET: only per-workspace connections
+    const login = async (email) =>
+      (await api.call("POST", "/auth/login", { body: { email, password: PASSWORD } })).data.token;
+    adminToken = await login("admin@acme.com");
+    empToken = await login("emp@acme.com");
+    superToken = await login("sa@platform.com");
+  });
+
+  after(async () => {
+    await api?.stop();
+    await db?.end();
+  });
+
+  const pkce = () => {
+    const verifier = crypto.randomBytes(48).toString("base64url");
+    return { verifier, challenge: crypto.createHash("sha256").update(verifier).digest("base64url") };
+  };
+  const approve = (tok, tenant, challenge, redirect_uri = CALLBACK) =>
+    api.call("POST", "/askmira-connection/approve", {
+      token: tok,
+      body: { tenant_id: tenant, tenant_name: "CGB Solutions", redirect_uri, state: "opaque-state", challenge },
+    });
+  const codeOf = (r) => new URL(r.data.redirect_to).searchParams.get("code");
+  const swap = (code, verifier, tenant_id) =>
+    api.call("POST", "/integrations/askmira/connect/token", { body: { code, verifier, tenant_id } });
+
+  async function signed(use, pathname, payload, secret) {
+    const body = JSON.stringify(payload);
+    const bh = crypto.createHash("sha256").update(body).digest("hex");
+    const t = await token(use, payload.tenant_id, { bh }, { secret });
+    return api.call("POST", `/integrations/askmira${pathname}`, { headers: { Authorization: `Bearer ${t}` }, body });
+  }
+  const sync = (tenant, secret) =>
+    signed("provision", "/users/sync", { tenant_id: tenant, complete: true, users: [] }, secret);
+
+  test("only a workspace admin may allow, and only towards an AskMira callback", async () => {
+    const T = crypto.randomUUID();
+    const { challenge } = pkce();
+    assert.equal((await approve(empToken, T, challenge)).status, 403);
+    assert.equal((await approve(superToken, T, challenge)).status, 403, "a super admin has no workspace to give");
+    for (const bad of ["http://askmira.test/settings/connectors/callback", "https://evil.test/steal",
+      "https://askmira.test/settings/connectors/callback?x=1"]) {
+      assert.equal((await approve(adminToken, T, challenge, bad)).status, 422, bad);
+    }
+  });
+
+  test("allow → swap → the secret reaches only that workspace; either side disconnects", async () => {
+    const T = crypto.randomUUID();
+    const other = crypto.randomUUID();
+    const { verifier, challenge } = pkce();
+    const allowed = await approve(adminToken, T, challenge);
+    assert.equal(allowed.status, 200);
+    const back = new URL(allowed.data.redirect_to);
+    assert.equal(back.origin + back.pathname, CALLBACK);
+    assert.equal(back.searchParams.get("state"), "opaque-state");
+    const code = codeOf(allowed);
+
+    assert.equal((await swap(code, pkce().verifier, T)).status, 400, "wrong verifier");
+    assert.equal((await swap(code, verifier, T)).status, 400, "and the code is spent");
+
+    const again = await approve(adminToken, T, challenge);
+    const made = await swap(codeOf(again), verifier, T);
+    assert.equal(made.status, 200);
+    assert.equal(made.data.external_ref, "acme");
+    const secret = made.data.secret;
+    const { rows } = await db.query(`SELECT * FROM askmira_links WHERE askmira_tenant_id = $1`, [T]);
+    assert.equal(rows[0].slug, "acme");
+    assert.ok(!JSON.stringify(rows).includes(secret), "the secret is never stored");
+
+    assert.equal((await sync(T, secret)).status, 200);
+    assert.equal((await sync(other, secret)).status, 404, "another workspace: nothing to check it with");
+    const status = await api.call("GET", "/askmira-connection", { token: adminToken });
+    assert.equal(status.data.connected, true);
+    assert.equal(status.data.askmira_origin, "https://askmira.test");
+
+    // Connected to T, Acme can't be given to another AskMira workspace.
+    assert.equal((await approve(adminToken, other, challenge)).status, 409);
+
+    // AskMira disconnects: the secret stops working.
+    assert.equal((await signed("revoke", "/connect/revoke", { tenant_id: T }, secret)).status, 200);
+    assert.equal((await sync(T, secret)).status, 404);
+
+    // Connect again, then disconnect from this side.
+    const third = await swap(codeOf(await approve(adminToken, T, challenge)), verifier, T);
+    assert.equal((await sync(T, third.data.secret)).status, 200);
+    const gone = await api.call("DELETE", "/askmira-connection", { token: adminToken });
+    assert.equal(gone.data.connected, false);
+    assert.equal((await sync(T, third.data.secret)).status, 404);
+  });
+});

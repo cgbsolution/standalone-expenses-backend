@@ -27,6 +27,8 @@ const PUBLIC = new Set([
   "POST /integrations/askmira/organizations", // AskMira's signed assertion, checked in the route
   "POST /integrations/askmira/users/sync",
   "POST /integrations/askmira/query", // read-only, same signed assertion (use=query)
+  "POST /integrations/askmira/connect/token", // one-time code + PKCE verifier, checked in the route
+  "POST /integrations/askmira/connect/revoke", // signed with the workspace's own secret (use=revoke)
   "POST /auth/askmira/exchange", // one-time AskMira launch token, checked in the route
 ]);
 

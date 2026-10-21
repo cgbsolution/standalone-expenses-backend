@@ -63,6 +63,8 @@ app.use("/api-docs", swaggerUi.serve, swaggerUi.setup(swaggerDocs));
 const askmira = require("./routes/askmira");
 app.use("/integrations/askmira", askmira.integrationRouter);
 app.use("/auth/askmira", askmira.authRouter);
+// A workspace admin's "AskMira connection" screen and Allow (signed in, unlike the two above).
+app.use("/askmira-connection", askmira.connectionRouter);
 
 const masterExpenseRoute = require("./routes/masterExpense");
 app.use("/master-expense", masterExpenseRoute);
@@ -126,6 +128,27 @@ async function ensureSchema() {
         askmira_tenant_id TEXT PRIMARY KEY,
         slug TEXT NOT NULL UNIQUE,
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+    // A workspace's own connection to AskMira, made from AskMira's Connectors (routes/askmira.js):
+    // only a nonce is kept; the secret is derived from it and AUTH_JWT_SECRET.
+    await pool.query(`ALTER TABLE askmira_links ADD COLUMN IF NOT EXISTS secret_nonce TEXT`);
+    await pool.query(`ALTER TABLE askmira_links ADD COLUMN IF NOT EXISTS askmira_name TEXT`);
+    await pool.query(`ALTER TABLE askmira_links ADD COLUMN IF NOT EXISTS askmira_origin TEXT`);
+    await pool.query(`ALTER TABLE askmira_links ADD COLUMN IF NOT EXISTS connected_at TIMESTAMPTZ`);
+    await pool.query(`ALTER TABLE askmira_links ADD COLUMN IF NOT EXISTS connected_by TEXT`);
+    // One-time codes from "Allow", swapped by AskMira's server; only their hash is kept.
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS askmira_connect_codes (
+        code_hash TEXT PRIMARY KEY,
+        slug TEXT NOT NULL,
+        askmira_tenant_id TEXT NOT NULL,
+        askmira_name TEXT,
+        askmira_origin TEXT,
+        challenge TEXT NOT NULL,
+        user_email TEXT,
+        expires_at TIMESTAMPTZ NOT NULL,
+        used_at TIMESTAMPTZ
       )
     `);
     // One-time AskMira sign-in links that have been used.
