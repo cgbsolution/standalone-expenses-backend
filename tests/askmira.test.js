@@ -187,6 +187,17 @@ describe("AskMira queries", { skip: SKIP }, () => {
     });
   }
 
+  async function act(kind, who, params = {}, opts = {}) {
+    const payload = { tenant_id: opts.tenant || T1, actor: who, kind, params };
+    const body = JSON.stringify(payload);
+    const bh = crypto.createHash("sha256").update(body).digest("hex");
+    const t = opts.token || (await token(opts.use || "act", opts.sub || payload.tenant_id, { bh }));
+    return api.call("POST", "/integrations/askmira/act", {
+      headers: { Authorization: `Bearer ${t}` },
+      body,
+    });
+  }
+
   async function provision(pathname, payload) {
     const body = JSON.stringify(payload);
     const bh = crypto.createHash("sha256").update(body).digest("hex");
@@ -300,13 +311,89 @@ describe("AskMira queries", { skip: SKIP }, () => {
     assert.deepEqual(mine.data.by_status.map((row) => [row.status, row.amount]), [["Approved", "500.25"]]);
   });
 
+  test("summary says who submitted how much, and month by month", async () => {
+    const r = await ask("summary", hr, { scope: "company" });
+    assert.equal(r.status, 200, api.log().slice(-1200));
+    assert.deepEqual(
+      r.data.by_submitter.map((row) => [row.submitter, row.email, row.count, row.amount]),
+      [["Mgr", "mgr@newco.com", 1, "4000.00"], ["Rep", "rep@newco.com", 3, "1849.75"]],
+    );
+    const months = r.data.by_month;
+    assert.equal(months.reduce((n, row) => n + row.count, 0), 4);
+    assert.ok(months.every((row) => /^\d{4}-\d{2}$/.test(row.month)));
+    assert.ok(months.some((row) => row.people === 2), "this month: Rep and Mgr");
+
+    // An employee's summary is only ever their own.
+    const mine = await ask("summary", rep, { scope: "mine" });
+    assert.deepEqual(mine.data.by_submitter.map((row) => row.submitter), ["Rep"]);
+    assert.ok(mine.data.by_month.every((row) => row.people === 1));
+    assert.ok(!JSON.stringify(mine.data).includes("Mgr"));
+  });
+
+  test("payable: approved and unpaid claims, with who submitted them, for an admin only", async () => {
+    const r = await ask("payable", hr, { scope: "company" });
+    assert.equal(r.status, 200, JSON.stringify(r.data));
+    assert.deepEqual(
+      r.data.claims.map((c) => [c.reference, c.submitter_email, c.amount]),
+      [["c2", "rep@newco.com", "500.25"]],
+      "c3 is paid already, c1 pending, c4 a draft, b1 another tenant's",
+    );
+    assert.equal((await ask("payable", rep, { scope: "mine" })).status, 403);
+    assert.equal((await ask("payable", rep, { scope: "company" })).status, 403);
+  });
+
+  test("claims.paid records payroll's payment once, and only on this tenant's approved claims", async () => {
+    const paid = await act("claims.paid", hr, {
+      references: ["c2", "c1", "c3", "b1", "nope"],
+      paid_on: "2026-11-30",
+      note: "Paid with salary for November 2026",
+    });
+    assert.equal(paid.status, 200, JSON.stringify(paid.data));
+    assert.deepEqual(paid.data.paid, ["c2"]);
+    assert.deepEqual(
+      Object.fromEntries(paid.data.skipped.map((s) => [s.reference, s.reason])),
+      { c1: "Not approved.", c3: "Already paid.", b1: "Not a claim of this workspace.", nope: "Not a claim of this workspace." },
+    );
+    const { rows } = await db.query(`SELECT data FROM expenses WHERE id = 'c2'`);
+    assert.equal(rows[0].data.PaymentStatus, "Paid");
+    assert.equal(rows[0].data.PaymentInfo.Method, "AskMira payroll");
+    assert.ok(rows[0].data.ApprovalHistory.at(-1).comments.includes("November 2026"));
+    assert.deepEqual((await ask("payable", hr, { scope: "company" })).data.claims, []);
+
+    const again = await act("claims.paid", hr, { references: ["c2"], paid_on: "2026-11-30" });
+    assert.deepEqual(again.data.paid, []);
+    assert.equal(again.data.skipped[0].reason, "Already paid.");
+  });
+
+  test("claims.paid is refused for the wrong person, token or replay", async () => {
+    const params = { references: ["c1"], paid_on: "2026-11-30" };
+    assert.equal((await act("claims.paid", rep, params)).status, 403, "not an admin");
+    assert.equal((await act("claims.paid", { ...hr, role: "employee" }, params)).status, 403);
+    assert.equal((await act("claims.paid", actor("admin@beta.com", "admin"), params)).status, 403);
+    assert.equal((await act("claims.paid", hr, params, { use: "query" })).status, 401);
+    assert.equal((await act("claims.paid", hr, { references: [], paid_on: "2026-11-30" })).status, 422);
+    assert.equal((await act("claims.paid", hr, { references: ["c1"], paid_on: "soon" })).status, 422);
+    assert.equal((await act("refund.everything", hr, params)).status, 422);
+
+    // The same signed request twice: the second is refused.
+    const payload = { tenant_id: T1, actor: hr, kind: "claims.paid", params };
+    const body = JSON.stringify(payload);
+    const bh = crypto.createHash("sha256").update(body).digest("hex");
+    const t = await token("act", T1, { bh });
+    const send = () => api.call("POST", "/integrations/askmira/act", { headers: { Authorization: `Bearer ${t}` }, body });
+    assert.equal((await send()).status, 200);
+    assert.equal((await send()).status, 401);
+  });
+
   test("a window and a search narrow it; wildcards are literal", async () => {
     const now = Date.now();
     const window = { scope: "mine", from: new Date(now - 7 * 864e5).toISOString(), to: new Date(now + 864e5).toISOString() };
     assert.equal((await ask("claims", rep, window)).data.total, 2, "the 60-day-old draft is outside");
     assert.equal((await ask("claims", rep, { scope: "mine", query: "cab" })).data.total, 1);
     assert.equal((await ask("claims", rep, { scope: "mine", query: "%" })).data.total, 0);
-    const tooLong = { scope: "mine", from: "2026-01-01T00:00:00Z", to: "2026-12-31T00:00:00Z" };
+    const year = { scope: "mine", from: new Date(now - 365 * 864e5).toISOString(), to: new Date(now + 864e5).toISOString() };
+    assert.equal((await ask("claims", rep, year)).data.total, 3, "a year back is allowed, and finds the old draft");
+    const tooLong = { scope: "mine", from: "2025-01-01T00:00:00Z", to: "2026-12-31T00:00:00Z" };
     assert.equal((await ask("claims", rep, tooLong)).status, 422);
   });
 
@@ -429,5 +516,262 @@ describe("AskMira Connectors: a workspace admin connects from AskMira", { skip: 
     const gone = await api.call("DELETE", "/askmira-connection", { token: adminToken });
     assert.equal(gone.data.connected, false);
     assert.equal((await sync(T, third.data.secret)).status, 404);
+  });
+});
+
+describe("AskMira: claims filed and decided from Ask Mira", { skip: SKIP }, () => {
+  let db;
+  let api;
+  const T = crypto.randomUUID();
+  const actor = (email, role = "employee") => ({ id: crypto.randomUUID(), email, role });
+  const hr = actor("hr@claims.co", "admin");
+  const mgr = actor("mgr@claims.co");
+  const rep = actor("rep@claims.co");
+  const loner = actor("loner@claims.co");
+  const today = new Date().toISOString().split("T")[0];
+
+  async function act(kind, who, params = {}) {
+    const payload = { tenant_id: T, actor: who, kind, params };
+    const body = JSON.stringify(payload);
+    const bh = crypto.createHash("sha256").update(body).digest("hex");
+    const t = await token("act", T, { bh });
+    return api.call("POST", "/integrations/askmira/act", { headers: { Authorization: `Bearer ${t}` }, body });
+  }
+
+  async function provision(pathname, payload) {
+    const body = JSON.stringify(payload);
+    const bh = crypto.createHash("sha256").update(body).digest("hex");
+    const t = await token("provision", payload.tenant_id, { bh });
+    return api.call("POST", `/integrations/askmira${pathname}`, { headers: { Authorization: `Bearer ${t}` }, body });
+  }
+
+  before(async () => {
+    db = await resetDatabase();
+    api = await startApi({ ASKMIRA_SHARED_SECRET: SECRET });
+    assert.equal((await provision("/organizations", { tenant_id: T, name: "Claims Co", slug: "claimsco", domain: null })).status, 200);
+    await seedPeople(db, [
+      ["hr@claims.co", "HR", "admin", "claimsco"],
+      ["mgr@claims.co", "Mgr", "employee", "claimsco", "hr@claims.co"],
+      ["rep@claims.co", "Rep", "employee", "claimsco", "mgr@claims.co", "hr@claims.co"],
+      ["loner@claims.co", "Loner", "employee", "claimsco"],
+    ]);
+    await db.query(`UPDATE employees SET grade = 'G1' WHERE email = 'rep@claims.co'`);
+    await db.query(
+      `INSERT INTO expense_categories (slug, name, normalized, requires_bill) VALUES
+         ('claimsco', 'Travel', 'TRAVEL', false), ('claimsco', 'Meals', 'MEALS', true)`,
+    );
+    await db.query(
+      `INSERT INTO tenant_policy_caps (slug, normalized, grade, cap_amount, is_actuals) VALUES
+         ('claimsco', 'TRAVEL', 'G1', 2000, false)`,
+    );
+  });
+
+  after(async () => {
+    await api?.stop();
+    await db?.end();
+  });
+
+  // Each call is its own bill: a bill already claimed is refused.
+  const cab = (amount = "850.50", category = "travel", invoice = `UB-${crypto.randomUUID().slice(0, 8)}`) => ({
+    key: `msg-${crypto.randomUUID()}`,
+    title: "Cab to the client",
+    lines: [{ category, amount, date: today, vendor: "Uber", invoice_number: invoice, description: "Airport to office" }],
+  });
+
+  async function ask(kind, who, params = {}) {
+    const payload = { tenant_id: T, actor: who, kind, params };
+    const body = JSON.stringify(payload);
+    const bh = crypto.createHash("sha256").update(body).digest("hex");
+    const t = await token("query", T, { bh });
+    return api.call("POST", "/integrations/askmira/query", { headers: { Authorization: `Bearer ${t}` }, body });
+  }
+
+  test("a claim from a receipt goes to the manager, once, with its lines as the app writes them", async () => {
+    const params = cab();
+    const filed = await act("claim.create", rep, params);
+    assert.equal(filed.status, 200, JSON.stringify(filed.data));
+    assert.equal(filed.data.claim.status, "Pending");
+    assert.equal(filed.data.claim.approver, "mgr@claims.co");
+    assert.equal(filed.data.claim.amount, "850.50");
+    const { rows } = await db.query(`SELECT * FROM expenses WHERE unique_key = $1`, [`askmira:${params.key}`]);
+    assert.equal(rows.length, 1);
+    const [line] = rows[0].data.ExpenseData;
+    assert.equal(line.Category, "Travel");
+    assert.equal(line.InvoiceAmount, 850.5);
+    assert.equal(line.VendorName, "Uber");
+    assert.equal(rows[0].submitter_email, "rep@claims.co");
+    // Asking again returns the same claim, never a second.
+    const again = await act("claim.create", rep, params);
+    assert.equal(again.data.existing, true);
+    const count = await db.query(`SELECT COUNT(*)::int AS n FROM expenses WHERE unique_key = $1`, [`askmira:${params.key}`]);
+    assert.equal(count.rows[0].n, 1);
+  });
+
+  test("a category that needs a bill stays a draft until the bill is attached", async () => {
+    const filed = await act("claim.create", rep, { ...cab("400", "Meals"), title: "Team lunch" });
+    assert.equal(filed.status, 200, JSON.stringify(filed.data));
+    assert.equal(filed.data.claim.status, "Draft");
+    assert.deepEqual(filed.data.needs_bill, ["Meals"]);
+  });
+
+  test("the grade's cap, the categories, the amount and the date are checked", async () => {
+    const over = await act("claim.create", rep, cab("2500"));
+    assert.equal(over.status, 422);
+    assert.match(over.data.error, /Travel is capped at ₹2,000 for grade G1; this bill is ₹2,500/);
+    const unknown = await act("claim.create", rep, cab("100", "Yacht"));
+    assert.equal(unknown.status, 422);
+    assert.match(unknown.data.error, /"Yacht" is not a category here. These are: Meals, Travel/);
+    for (const amount of ["abc", "-5", "0", "12.345", "1e5", ""]) {
+      assert.equal((await act("claim.create", rep, cab(amount))).status, 422, `amount ${amount}`);
+    }
+    const future = cab();
+    future.lines[0].date = "2999-01-01";
+    assert.equal((await act("claim.create", rep, future)).status, 422);
+    const noKey = { ...cab(), key: "" };
+    assert.equal((await act("claim.create", rep, noKey)).status, 422);
+    const nobody = await act("claim.create", loner, cab());
+    assert.equal(nobody.status, 422);
+    assert.match(nobody.data.error, /No approver is set for you/);
+    const stranger = await act("claim.create", actor("stranger@else.com"), cab());
+    assert.equal(stranger.status, 403);
+  });
+
+  test("the approver decides it through the same two levels; nobody else can", async () => {
+    const filed = await act("claim.create", rep, cab("300"));
+    const reference = filed.data.claim.reference;
+    assert.equal((await act("claim.decide", rep, { reference, decision: "approve" })).status, 403, "own claim");
+    assert.equal((await act("claim.decide", loner, { reference, decision: "approve" })).status, 403);
+    assert.equal((await act("claim.decide", mgr, { reference, decision: "reject" })).status, 422, "a rejection needs a reason");
+
+    const first = await act("claim.decide", mgr, { reference, decision: "approve", comment: "Fine" });
+    assert.equal(first.status, 200, JSON.stringify(first.data));
+    // Approved by the manager, it waits on finance now.
+    assert.equal(first.data.claim.status, "Pending");
+    assert.equal(first.data.claim.next_approver, "hr@claims.co");
+    assert.equal((await act("claim.decide", mgr, { reference, decision: "approve" })).status, 403, "no longer theirs");
+    // An ExpGenie admin who is not its approver can't finalise it from Ask Mira either.
+    assert.equal((await act("claim.decide", actor("other-admin@claims.co", "admin"), { reference, decision: "approve" })).status, 403);
+
+    const final = await act("claim.decide", hr, { reference, decision: "approve" });
+    assert.equal(final.data.claim.status, "Approved");
+    assert.equal((await act("claim.decide", hr, { reference, decision: "approve" })).status, 409, "decided already");
+    const { rows } = await db.query(`SELECT data FROM expenses WHERE unique_key = $1`, [reference]);
+    assert.ok(rows[0].data.ApprovalHistory.some((h) => /Fine \(from Ask Mira\)/.test(h.comments)));
+  });
+
+  test("one bill split into lines is still over the cap; separate bills each count alone", async () => {
+    const split = cab("2000", "travel", "UB-SPLIT");
+    split.lines.push({ ...split.lines[0], amount: "500", description: "balance" });
+    const refused = await act("claim.create", rep, split);
+    assert.equal(refused.status, 422, JSON.stringify(refused.data));
+    assert.match(refused.data.error, /Travel is capped at ₹2,000 for grade G1; this bill is ₹2,500/);
+
+    const two = cab("1500", "travel", "UB-A1");
+    two.lines.push({ ...two.lines[0], amount: "1200", invoice_number: "UB-A2" });
+    const filed = await act("claim.create", rep, two);
+    assert.equal(filed.status, 200, JSON.stringify(filed.data));
+    assert.equal(filed.data.claim.amount, "2700.00");
+  });
+
+  test("a bill already claimed is refused, and named in the bills query", async () => {
+    const first = cab("640", "travel", "UB-DUP");
+    assert.equal((await act("claim.create", rep, first)).status, 200);
+    const again = await act("claim.create", rep, { ...cab("640", "travel", "UB-DUP"), title: "Same cab" });
+    assert.equal(again.status, 409);
+    assert.match(again.data.error, /already claimed in “Cab to the client” \(Pending\)/);
+    // The same vendor, date and amount with no invoice number is the same bill too.
+    const bare = cab("777", "travel", "");
+    assert.equal((await act("claim.create", rep, bare)).status, 200);
+    assert.equal((await act("claim.create", rep, cab("777", "travel", ""))).status, 409);
+
+    const asked = await ask("bills", rep, { lines: first.lines });
+    assert.equal(asked.status, 200, JSON.stringify(asked.data));
+    assert.equal(asked.data.duplicates.length, 1);
+    assert.equal(asked.data.duplicates[0].line, 1);
+    // Someone else's claim of the same invoice is not theirs to know of.
+    const mine = await ask("bills", loner, { lines: first.lines });
+    assert.deepEqual(mine.data.duplicates, []);
+  });
+
+  test("a rejection keeps its reason; a claim is decided by its own id", async () => {
+    const filed = await act("claim.create", rep, cab("410"));
+    const { reference } = filed.data.claim;
+    const waiting = await ask("claims", mgr, { scope: "approvals", status: "pending", query: "Rep cab" });
+    assert.equal(waiting.status, 200, JSON.stringify(waiting.data));
+    const listed = waiting.data.claims.find((c) => c.reference === reference);
+    assert.ok(listed && listed.id, "each claim names its own id; 'Rep cab' matches by words");
+    const rejected = await act("claim.decide", mgr, {
+      id: listed.id, reference, decision: "reject", comment: "Client visit was cancelled",
+    });
+    assert.equal(rejected.status, 200, JSON.stringify(rejected.data));
+    const { rows } = await db.query(`SELECT data FROM expenses WHERE id = $1`, [listed.id]);
+    assert.equal(rows[0].data.RejectionInfo.Reason, "Client visit was cancelled");
+    assert.equal(rows[0].data.ApprovalHistory.at(-1).reason, "Client visit was cancelled");
+  });
+
+  test("two references alike are refused rather than guessed", async () => {
+    const a = await act("claim.create", rep, cab("120"));
+    const b = await act("claim.create", rep, cab("130"));
+    await db.query(`UPDATE expenses SET unique_key = 'R-77' WHERE unique_key IN ($1, $2)`, [
+      a.data.claim.reference, b.data.claim.reference,
+    ]);
+    const decided = await act("claim.decide", mgr, { reference: "R-77", decision: "approve" });
+    assert.equal(decided.status, 409);
+  });
+
+  test("a suspended workspace neither files, decides nor reads through AskMira", async () => {
+    await db.query(`UPDATE tenant_settings SET status = 'suspended' WHERE slug = 'claimsco'`);
+    try {
+      assert.equal((await act("claim.create", rep, cab("90"))).status, 403);
+      assert.equal((await ask("claims", rep, { scope: "mine" })).status, 403);
+    } finally {
+      await db.query(`UPDATE tenant_settings SET status = 'active' WHERE slug = 'claimsco'`);
+    }
+  });
+});
+
+describe("AskMira: the categories a person may claim under", { skip: SKIP }, () => {
+  let db;
+  let api;
+  const T = crypto.randomUUID();
+  const rep = { id: crypto.randomUUID(), email: "rep@cats.co", role: "employee" };
+
+  async function ask(kind, who, params = {}) {
+    const payload = { tenant_id: T, actor: who, kind, params };
+    const body = JSON.stringify(payload);
+    const bh = crypto.createHash("sha256").update(body).digest("hex");
+    const t = await token("query", T, { bh });
+    return api.call("POST", "/integrations/askmira/query", { headers: { Authorization: `Bearer ${t}` }, body });
+  }
+
+  before(async () => {
+    db = await resetDatabase();
+    api = await startApi({ ASKMIRA_SHARED_SECRET: SECRET });
+    const body = JSON.stringify({ tenant_id: T, name: "Cats", slug: "cats", domain: null });
+    const bh = crypto.createHash("sha256").update(body).digest("hex");
+    const t = await token("provision", T, { bh });
+    await api.call("POST", "/integrations/askmira/organizations", { headers: { Authorization: `Bearer ${t}` }, body });
+    await seedPeople(db, [["rep@cats.co", "Rep", "employee", "cats"]]);
+    await db.query(`UPDATE employees SET grade = 'G2' WHERE email = 'rep@cats.co'`);
+    await db.query(`INSERT INTO expense_categories (slug, name, normalized, requires_bill, enabled) VALUES
+      ('cats', 'Travel', 'TRAVEL', false, true), ('cats', 'Meals', 'MEALS', true, true),
+      ('cats', 'Retired', 'OLD', true, false), ('other', 'Secret', 'SEC', true, true)`);
+    await db.query(`INSERT INTO tenant_policy_caps (slug, normalized, grade, cap_amount, is_actuals) VALUES
+      ('cats', 'TRAVEL', 'G2', 1500, false), ('cats', 'MEALS', 'G2', 900, true), ('cats', 'TRAVEL', 'G9', 99, false)`);
+  });
+
+  after(async () => {
+    await api?.stop();
+    await db?.end();
+  });
+
+  test("this workspace's enabled categories, with the person's own grade cap", async () => {
+    const answer = await ask("categories", rep);
+    assert.equal(answer.status, 200, JSON.stringify(answer.data));
+    assert.equal(answer.data.grade, "G2");
+    assert.deepEqual(answer.data.categories, [
+      { name: "Meals", requires_bill: true, cap: null },
+      { name: "Travel", requires_bill: false, cap: "1500" },
+    ]);
   });
 });

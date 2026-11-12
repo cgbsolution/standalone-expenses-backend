@@ -61,6 +61,8 @@ app.use("/api-docs", swaggerUi.serve, swaggerUi.setup(swaggerDocs));
 // AskMira (HRMS) link — mounted first so /integrations/:slug never shadows it.
 // Off unless ASKMIRA_SHARED_SECRET is set. See routes/askmira.js.
 const askmira = require("./routes/askmira");
+// AskMira's platform creating or attaching a workspace: off unless ASKMIRA_PLATFORM_SECRET is set.
+app.use("/integrations/askmira/platform", require("./routes/askmira_platform").platformRouter);
 app.use("/integrations/askmira", askmira.integrationRouter);
 app.use("/auth/askmira", askmira.authRouter);
 // A workspace admin's "AskMira connection" screen and Allow (signed in, unlike the two above).

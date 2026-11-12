@@ -96,6 +96,78 @@ function rowToShape(row) {
 }
 
 /**
+ * Write a new expense: its lines enriched, its total, its first history entry,
+ * then tell the approver. The caller has already decided who submits it and who
+ * approves it (the API from the signed-in person; AskMira from its signed actor).
+ */
+async function createExpense(
+  payload,
+  { comment = "Expense submitted and parked successfully", notifyDrafts = true } = {}
+) {
+  const { SubmitterEmail, ApproverEmail, ApprovalStatus } = payload;
+  const enrichedData = (payload.ExpenseData || []).map(enrichInvoice);
+  // Summed in paise: a float sum of 2838.60 + 4609.29 + 46.11 is 7493.999…
+  const totalAmount =
+    enrichedData.reduce((sum, inv) => sum + Math.round((Number(inv.InvoiceAmount) || 0) * 100), 0) / 100;
+
+  const id = Date.now().toString();
+  const submissionDate = new Date().toISOString();
+
+  const enrichedPayload = {
+    ...payload,
+    SubmitterEmail,
+    ApproverEmail,
+    ApprovalStatus: initialStatus(ApprovalStatus),
+    ExpenseData: enrichedData,
+    SubmissionDate: submissionDate,
+    TotalAmount: totalAmount,
+    ApprovalHistory: [
+      {
+        at: submissionDate,
+        by: SubmitterEmail,
+        from: "Start",
+        to: initialStatus(ApprovalStatus),
+        comments: comment,
+      },
+    ],
+  };
+
+  const { flat, data } = splitForInsert(enrichedPayload, id);
+
+  const { rows } = await pool.query(
+    `INSERT INTO expenses
+       (id, user_id, unique_key, approver_email, submitter_email, submitter_name,
+        approval_status, data, created_at, updated_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
+     RETURNING *`,
+    [
+      flat.id,
+      flat.user_id,
+      flat.unique_key,
+      flat.approver_email,
+      flat.submitter_email,
+      flat.submitter_name,
+      flat.approval_status,
+      data,
+    ]
+  );
+
+  const saved = rowToShape(rows[0]);
+  console.log(`POST /master-expense saved id=${saved.id} from=${SubmitterEmail} approver=${ApproverEmail}`);
+
+  // The API has always told the approver, draft or not; AskMira tells them only once it is sent.
+  if (notifyDrafts || saved.ApprovalStatus === "Pending") {
+    setImmediate(() =>
+      safeNotify("expense.submitted", {
+        expense: saved,
+        recipient: saved.ApproverEmail,
+      })
+    );
+  }
+  return saved;
+}
+
+/**
  * @swagger
  * tags:
  *   name: MasterExpense
@@ -154,64 +226,7 @@ router.post("/", async (req, res) => {
       ApproverEmail = routed.approver;
     }
 
-    const enrichedData = ExpenseData.map(enrichInvoice);
-    const totalAmount = enrichedData.reduce(
-      (sum, inv) => sum + (Number(inv.InvoiceAmount) || 0),
-      0
-    );
-
-    const id = Date.now().toString();
-    const submissionDate = new Date().toISOString();
-
-    const enrichedPayload = {
-      ...req.body,
-      SubmitterEmail,
-      ApproverEmail,
-      ApprovalStatus: initialStatus(ApprovalStatus),
-      ExpenseData: enrichedData,
-      SubmissionDate: submissionDate,
-      TotalAmount: totalAmount,
-      ApprovalHistory: [
-        {
-          at: submissionDate,
-          by: SubmitterEmail,
-          from: "Start",
-          to: initialStatus(ApprovalStatus),
-          comments: "Expense submitted and parked successfully",
-        },
-      ],
-    };
-
-    const { flat, data } = splitForInsert(enrichedPayload, id);
-
-    const { rows } = await pool.query(
-      `INSERT INTO expenses
-         (id, user_id, unique_key, approver_email, submitter_email, submitter_name,
-          approval_status, data, created_at, updated_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
-       RETURNING *`,
-      [
-        flat.id,
-        flat.user_id,
-        flat.unique_key,
-        flat.approver_email,
-        flat.submitter_email,
-        flat.submitter_name,
-        flat.approval_status,
-        data,
-      ]
-    );
-
-    const saved = rowToShape(rows[0]);
-    console.log(`POST /master-expense saved id=${saved.id} from=${SubmitterEmail} approver=${ApproverEmail}`);
-
-    setImmediate(() =>
-      safeNotify("expense.submitted", {
-        expense: saved,
-        recipient: saved.ApproverEmail,
-      })
-    );
-
+    const saved = await createExpense({ ...req.body, SubmitterEmail, ApproverEmail, ApprovalStatus });
     return res.status(200).json(saved);
   } catch (error) {
     console.error("Error submitting master expense:", error);
@@ -520,7 +535,7 @@ async function lookupFinanceManagerEmail(submitterEmail) {
  *
  *   SAP integration is intentionally NOT called — removed by request.
  */
-async function updateStatus(id, body) {
+async function updateStatus(id, body, { expectApprover = null } = {}) {
   const { ApprovalStatus, UpdatedBy, Comments, RejectionReason } = body || {};
   if (!ApprovalStatus) {
     const err = new Error("ApprovalStatus is required");
@@ -612,6 +627,9 @@ async function updateStatus(id, body) {
     ],
   };
 
+  // With expectApprover (a decision from AskMira), it lands only if the claim is still
+  // pending with that approver as it was read: two decisions at once can't both count.
+  const guarded = Boolean(expectApprover);
   const { rows: updatedRows } = await pool.query(
     `UPDATE expenses
        SET approval_status = $1,
@@ -619,9 +637,17 @@ async function updateStatus(id, body) {
            data            = $3,
            updated_at      = NOW()
      WHERE id = $4
+       ${guarded ? "AND LOWER(COALESCE(approver_email, '')) = LOWER($5) AND approval_status IS NOT DISTINCT FROM $6" : ""}
      RETURNING *`,
-    [newApprovalStatus, newApproverEmail, mergedData, id]
+    guarded
+      ? [newApprovalStatus, newApproverEmail, mergedData, id, expectApprover, existingRow.approval_status]
+      : [newApprovalStatus, newApproverEmail, mergedData, id]
   );
+  if (!updatedRows.length) {
+    const err = new Error("This claim was decided meanwhile. Look it up again.");
+    err.status = 409;
+    throw err;
+  }
 
   const updated = rowToShape(updatedRows[0]);
   console.log(
@@ -1089,3 +1115,9 @@ router.post("/notify", async (req, res) => {
 });
 
 module.exports = router;
+// Shared with the AskMira link (routes/askmira.js), so a claim filed or decided
+// from Ask Mira follows exactly the same rules as one in ExpGenie.
+module.exports.createExpense = createExpense;
+module.exports.resolveApprover = resolveApprover;
+module.exports.updateStatus = updateStatus;
+module.exports.rowToShape = rowToShape;

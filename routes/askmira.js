@@ -30,7 +30,17 @@ const express = require("express");
 const { decodeJwt, jwtVerify } = require("jose");
 const pool = require("../dbClient");
 const { signedIn } = require("./auth");
-const { normEmail } = require("../middleware/auth");
+const { normEmail, SUSPENDED_MESSAGE } = require("../middleware/auth");
+
+// As for a signed-in dashboard request (middleware/auth.js loadCaller).
+const BLOCKED_TENANT_STATUSES = new Set(["suspended", "churned"]);
+
+async function refuseBlocked(slug) {
+  const { rows } = await pool.query(`SELECT status FROM tenant_settings WHERE slug = $1`, [slug]);
+  if (BLOCKED_TENANT_STATUSES.has(String(rows[0]?.status || "").toLowerCase())) {
+    throw httpError(403, SUSPENDED_MESSAGE);
+  }
+}
 
 const AUDIENCE = "askmira:expense";
 const ISSUER = "askmira";
@@ -366,7 +376,8 @@ const SCOPES = new Set(["mine", "approvals", "company"]);
 const CLAIM_STATUSES = new Map(
   ["Pending", "Approved", "Rejected", "Draft"].map((status) => [status.toLowerCase(), status]),
 );
-const MAX_WINDOW_MS = 100 * 24 * 60 * 60 * 1000;
+// A year (and a day, for a leap year): AskMira asks about "the last 12 months".
+const MAX_WINDOW_MS = 366 * 24 * 60 * 60 * 1000;
 
 // A text expression as numeric, or NULL when it holds no number. Only ever
 // given SQL written in this file, never input.
@@ -431,15 +442,16 @@ function filtersFor(scope, actorEmail, params) {
   const from = instantOf(params.from, "from");
   const to = instantOf(params.to, "to");
   if (from && to && (to <= from || to - from > MAX_WINDOW_MS)) {
-    throw httpError(422, "The window must end after it starts, within 100 days.");
+    throw httpError(422, "The window must end after it starts, within a year.");
   }
   if (from) where.push(`c.created_at >= ${bind(from.toISOString())}::timestamptz`);
   if (to) where.push(`c.created_at < ${bind(to.toISOString())}::timestamptz`);
 
   const text = String(params.query || "").trim().slice(0, 100);
-  if (text) {
+  // "Meera auto": each word matches some field (a person and a title word), not the phrase.
+  for (const word of text.split(/\s+/).filter(Boolean).slice(0, 6)) {
     // ILIKE's own wildcards are taken literally.
-    const pattern = bind(`%${text.replace(/[\\%_]/g, (ch) => `\\${ch}`)}%`);
+    const pattern = bind(`%${word.replace(/[\\%_]/g, (ch) => `\\${ch}`)}%`);
     where.push(`(c.title ILIKE ${pattern} OR c.category ILIKE ${pattern} OR c.submitter ILIKE ${pattern})`);
   }
   return { where, values };
@@ -456,7 +468,7 @@ async function claimsAnswer(slug, actorEmail, scope, params) {
   const args = [slug, ...values];
   const { rows: [{ total }] } = await pool.query(`SELECT COUNT(*)::int AS total ${from}`, args);
   const { rows } = await pool.query(
-    `SELECT c.unique_key, c.title, c.submitter, c.status, c.payment, c.amount::text AS amount,
+    `SELECT c.id, c.unique_key, c.title, c.submitter, c.status, c.payment, c.amount::text AS amount,
             c.currency, c.category, c.created_at
        ${from}
       ORDER BY c.created_at DESC, c.id DESC
@@ -466,6 +478,7 @@ async function claimsAnswer(slug, actorEmail, scope, params) {
   return {
     total,
     claims: rows.map((row) => ({
+      id: String(row.id),
       reference: row.unique_key,
       title: row.title,
       submitter: row.submitter,
@@ -484,7 +497,7 @@ async function summaryAnswer(slug, actorEmail, scope, params) {
   const from = `FROM (${CLAIMS}) c ${where.length ? `WHERE ${where.join(" AND ")}` : ""}`;
   const unpaidFrom = `FROM (${CLAIMS}) c WHERE ${[...where, "c.status = 'Approved'", "c.payment = 'Unpaid'"].join(" AND ")}`;
   const args = [slug, ...values];
-  const [byStatus, byCategory, unpaid] = await Promise.all([
+  const [byStatus, byCategory, unpaid, bySubmitter, byMonth] = await Promise.all([
     pool.query(
       `SELECT c.status, c.currency, COUNT(*)::int AS count, SUM(c.amount)::text AS amount
          ${from} GROUP BY c.status, c.currency ORDER BY c.status, c.currency`,
@@ -500,15 +513,138 @@ async function summaryAnswer(slug, actorEmail, scope, params) {
          ${unpaidFrom} GROUP BY c.currency ORDER BY c.currency`,
       args,
     ),
+    // Who submitted how much. Only within the same scope as everything above:
+    // for "mine" that is the asker alone.
+    pool.query(
+      `SELECT c.submitter, LOWER(c.submitter_email) AS email, c.currency, COUNT(*)::int AS count,
+              SUM(c.amount)::text AS amount
+         ${from} GROUP BY c.submitter, LOWER(c.submitter_email), c.currency
+         ORDER BY SUM(c.amount) DESC, c.submitter LIMIT 500`,
+      args,
+    ),
+    // Month by month in India's time (a fixed +05:30: India keeps no daylight
+    // saving, and not every Postgres ships the zone names), with how many people.
+    pool.query(
+      `SELECT to_char(c.created_at AT TIME ZONE INTERVAL '+05:30', 'YYYY-MM') AS month, c.currency,
+              COUNT(*)::int AS count, COUNT(DISTINCT LOWER(c.submitter_email))::int AS people,
+              SUM(c.amount)::text AS amount
+         ${from} GROUP BY 1, c.currency ORDER BY 1, c.currency`,
+      args,
+    ),
   ]);
   return {
     by_status: byStatus.rows,
     by_category: byCategory.rows,
     approved_unpaid: unpaid.rows,
+    by_submitter: bySubmitter.rows,
+    by_month: byMonth.rows,
   };
 }
 
-const QUERIES = { claims: claimsAnswer, summary: summaryAnswer };
+// Approved claims nobody has paid yet, each with who submitted it: what AskMira's
+// payroll pays with salary. Company scope only (an admin here and in AskMira).
+async function payableAnswer(slug, actorEmail, scope) {
+  if (scope !== "company") throw httpError(403, "Only the whole company's claims are paid by payroll.");
+  const { rows } = await pool.query(
+    `SELECT c.unique_key, c.title, LOWER(c.submitter_email) AS submitter_email, c.submitter,
+            c.amount::text AS amount, c.currency, c.category, c.created_at
+       FROM (${CLAIMS}) c
+      WHERE c.status = 'Approved' AND c.payment = 'Unpaid' AND c.amount > 0
+      ORDER BY c.created_at, c.id
+      LIMIT 1000`,
+    [slug],
+  );
+  return {
+    claims: rows.map((row) => ({
+      reference: row.unique_key,
+      title: row.title,
+      submitter: row.submitter,
+      submitter_email: row.submitter_email,
+      amount: row.amount,
+      currency: row.currency,
+      category: row.category,
+      submitted_at: new Date(row.created_at).toISOString(),
+    })),
+  };
+}
+
+// The categories the person may claim under, whether each needs a bill, and the
+// cap their own grade has on it: what Ask Mira checks before it offers a claim.
+async function categoriesAnswer(slug, actorEmail) {
+  const { rows: [me] } = await pool.query(
+    `SELECT grade FROM employees WHERE LOWER(email) = LOWER($1) LIMIT 1`,
+    [actorEmail],
+  );
+  const grade = me && me.grade ? String(me.grade) : null;
+  const { rows } = await pool.query(
+    `SELECT c.name, c.requires_bill, p.cap_amount::text AS cap, p.is_actuals
+       FROM expense_categories c
+       LEFT JOIN tenant_policy_caps p
+              ON p.slug = c.slug AND p.grade = $2
+             AND LOWER(p.normalized) = LOWER(COALESCE(NULLIF(c.normalized, ''), c.name))
+      WHERE c.slug = $1 AND c.enabled IS NOT FALSE
+      ORDER BY c.name`,
+    [slug, grade],
+  );
+  return {
+    grade,
+    categories: rows.map((r) => ({
+      name: r.name,
+      requires_bill: r.requires_bill !== false,
+      // No cap, or "actuals" (whatever it cost): null.
+      cap: r.cap && !r.is_actuals && Number(r.cap) > 0 ? r.cap : null,
+    })),
+  };
+}
+
+// The same bill claimed before by this person, in a claim that is not rejected:
+// the same invoice number from the same vendor (or with no vendor given), or the
+// same vendor, date and amount.
+async function earlierClaimsOf(slug, actorEmail, lines) {
+  const found = [];
+  const { rows } = await pool.query(
+    `SELECT e.id, e.unique_key, e.approval_status,
+            COALESCE(NULLIF(TRIM(e.data->>'ExpenseTitle'), ''), 'Untitled claim') AS title,
+            item->>'InvoiceNumber' AS invoice, item->>'VendorName' AS vendor,
+            item->>'DocumentDate' AS day, item->>'InvoiceAmount' AS amount
+       FROM expenses e
+       JOIN employees s ON LOWER(s.email) = LOWER(e.submitter_email) AND s.tenant = $1
+       CROSS JOIN LATERAL jsonb_array_elements(
+         CASE WHEN jsonb_typeof(e.data->'ExpenseData') = 'array' THEN e.data->'ExpenseData' ELSE '[]'::jsonb END
+       ) AS item
+      WHERE LOWER(e.submitter_email) = LOWER($2)
+        AND COALESCE(e.approval_status, '') !~* '^reject'`,
+    [slug, actorEmail],
+  );
+  const same = (a, b) => String(a || "").trim().toLowerCase() === String(b || "").trim().toLowerCase();
+  lines.forEach((line, index) => {
+    const invoice = String(line.invoice_number || "").trim();
+    const vendor = String(line.vendor || "").trim();
+    const amount = Number(String(line.amount ?? "").replace(/[,₹\s]/g, ""));
+    const hit = rows.find((row) => {
+      if (invoice && same(row.invoice, invoice)) return !vendor || !row.vendor || same(row.vendor, vendor);
+      return Boolean(vendor) && same(row.vendor, vendor) && same(row.day, line.date) &&
+        Math.abs(Number(row.amount) - amount) < 0.005;
+    });
+    if (hit) {
+      found.push({ line: index + 1, reference: hit.unique_key, title: hit.title, status: hit.approval_status || "Pending" });
+    }
+  });
+  return found;
+}
+
+async function billsAnswer(slug, actorEmail, _scope, params) {
+  const lines = Array.isArray(params.lines) ? params.lines.slice(0, MAX_LINES) : [];
+  return { duplicates: await earlierClaimsOf(slug, actorEmail, lines) };
+}
+
+const QUERIES = {
+  claims: claimsAnswer,
+  summary: summaryAnswer,
+  payable: payableAnswer,
+  categories: categoriesAnswer,
+  bills: billsAnswer,
+};
 
 integrationRouter.post(
   "/query",
@@ -519,6 +655,7 @@ integrationRouter.post(
     if (!answer) throw httpError(422, "Unknown query.");
     const slug = await linkedSlug(String(req.body.tenant_id));
     if (!slug) throw httpError(404, "This workspace is not linked here yet.");
+    await refuseBlocked(slug);
 
     const actor = req.body.actor && typeof req.body.actor === "object" ? req.body.actor : {};
     const email = normEmail(actor.email);
@@ -541,6 +678,354 @@ integrationRouter.post(
     const result = await answer(slug, me.email, scope, params);
     console.log(`[AskMira] query ${kind}/${scope} for ${slug} by ${email}`);
     return { kind, scope, ...result };
+  }),
+);
+
+// ── Actions for AskMira ──────────────────────────────────────────────────────
+//
+//   POST /integrations/askmira/act   use=act, `bh` = SHA-256 of the body, each `jti` once
+//   { tenant_id, actor: { id, email, role }, kind: "claims.paid", params }
+//
+//   claims.paid   AskMira's payroll paid these approved claims with salary.
+//                 params: { references: [...], paid_on: "YYYY-MM-DD", note }
+//                 Each one of this tenant's, approved and still unpaid, is
+//                 marked Paid (Method "AskMira payroll") with a history entry;
+//                 anything else is skipped and says why. Asking again changes
+//                 nothing: a claim already paid is reported as such.
+//
+//   claim.create  The person files their own claim, from what Ask Mira read off a
+//                 receipt and they confirmed. params: { key, title, lines: [{ category,
+//                 amount, date, vendor, invoice_number, description }] }. The same
+//                 rules as filing it here: it goes to their manager on record, each
+//                 line's category must be one of this workspace's, and their grade's
+//                 cap for it applies. A category that needs a bill keeps the claim as
+//                 a Draft: the original is attached here before it is sent. `key`
+//                 makes asking twice return the first claim, never a second.
+//
+//   claim.decide  The person approves or rejects a claim waiting on them.
+//                 params: { reference, decision: "approve" | "reject", comment,
+//                 reason }. Only its current approver or an admin of this
+//                 workspace, only while pending, through the same two-level
+//                 workflow (manager, then finance) as the dashboard.
+//
+// claims.paid needs an active admin here whom AskMira also calls admin; the
+// others need only an active member of this workspace, acting for themselves.
+
+const MAX_PAID = 500;
+
+async function claimsPaid(slug, me, params) {
+  const refs = Array.isArray(params.references)
+    ? [...new Set(params.references.map((r) => String(r || "").trim()).filter(Boolean))]
+    : [];
+  if (!refs.length || refs.length > MAX_PAID) {
+    throw httpError(422, `Name between 1 and ${MAX_PAID} claims.`);
+  }
+  const paidOn = String(params.paid_on || "");
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(paidOn) || Number.isNaN(new Date(paidOn).getTime())) {
+    throw httpError(422, "paid_on must be a date, YYYY-MM-DD.");
+  }
+  const note = clean(params.note, 300) || "Paid with salary in AskMira payroll";
+  const { rows } = await pool.query(
+    `SELECT e.* FROM expenses e
+       JOIN employees s ON LOWER(s.email) = LOWER(e.submitter_email) AND s.tenant = $1
+      WHERE e.unique_key = ANY($2::text[])`,
+    [slug, refs],
+  );
+  const byRef = new Map(rows.map((row) => [row.unique_key, row]));
+  const paid = [];
+  const skipped = [];
+  const now = new Date().toISOString();
+  for (const ref of refs) {
+    const row = byRef.get(ref);
+    if (!row) {
+      skipped.push({ reference: ref, reason: "Not a claim of this workspace." });
+      continue;
+    }
+    if ((row.data?.PaymentStatus || "Unpaid") === "Paid") {
+      skipped.push({ reference: ref, reason: "Already paid." });
+      continue;
+    }
+    if (!/^approv/i.test(row.approval_status || "")) {
+      skipped.push({ reference: ref, reason: "Not approved." });
+      continue;
+    }
+    const data = {
+      ...row.data,
+      PaymentStatus: "Paid",
+      PaymentInfo: {
+        Method: "AskMira payroll",
+        PaidAt: new Date(paidOn).toISOString(),
+        PaidBy: me.email,
+        Reference: note,
+        Note: note,
+      },
+      LastActionAt: now,
+      ApprovalHistory: [
+        ...(Array.isArray(row.data?.ApprovalHistory) ? row.data.ApprovalHistory : []),
+        {
+          at: now,
+          by: me.email,
+          from: "Unpaid",
+          to: "Paid",
+          action_status: "Payment Recorded",
+          comments: `${note} (${paidOn}).`,
+        },
+      ],
+    };
+    // Only while still unpaid, so two calls at once cannot both record it.
+    const updated = await pool.query(
+      `UPDATE expenses SET data = $1, updated_at = NOW()
+        WHERE id = $2 AND COALESCE(data->>'PaymentStatus', 'Unpaid') <> 'Paid'`,
+      [data, row.id],
+    );
+    if (updated.rowCount) paid.push(ref);
+    else skipped.push({ reference: ref, reason: "Already paid." });
+  }
+  return { paid, skipped };
+}
+
+const masterExpense = require("./masterExpense");
+
+const MAX_LINES = 20;
+const MAX_AMOUNT = 10_000_000;
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+function rupees(n) {
+  return `₹${Number(n).toLocaleString("en-IN", { maximumFractionDigits: 2 })}`;
+}
+
+/** One claim line as typed, checked; or throws 422 saying what is wrong with it. */
+function lineOf(raw, index, categories) {
+  const where = `Line ${index + 1}`;
+  const item = raw && typeof raw === "object" ? raw : {};
+  const wanted = clean(item.category, 80);
+  if (!wanted) throw httpError(422, `${where}: which category is it?`);
+  const category = categories.find(
+    (c) => c.name.toLowerCase() === wanted.toLowerCase() || (c.normalized || "").toLowerCase() === wanted.toLowerCase(),
+  );
+  if (!category) {
+    const names = categories.map((c) => c.name).join(", ") || "none set up yet";
+    throw httpError(422, `${where}: "${wanted}" is not a category here. These are: ${names}.`);
+  }
+  const amountText = String(item.amount ?? "").replace(/[,₹\s]/g, "");
+  if (!/^\d+(\.\d{1,2})?$/.test(amountText) || Number(amountText) <= 0 || Number(amountText) > MAX_AMOUNT) {
+    throw httpError(422, `${where}: the amount must be a positive number of rupees with at most two decimals, up to ${rupees(MAX_AMOUNT)}.`);
+  }
+  const day = String(item.date || "");
+  const when = new Date(`${day}T00:00:00Z`);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(day) || Number.isNaN(when.getTime())) {
+    throw httpError(422, `${where}: the bill's date must be YYYY-MM-DD.`);
+  }
+  if (when.getTime() > Date.now() + DAY_MS) throw httpError(422, `${where}: the bill's date is in the future.`);
+  if (when.getTime() < Date.now() - 366 * DAY_MS) throw httpError(422, `${where}: the bill is more than a year old.`);
+  return {
+    category,
+    amount: Number(amountText),
+    line: {
+      Category: category.name,
+      ExpenseType: category.name,
+      InvoiceAmount: Number(amountText),
+      DocumentDate: day,
+      PostingDate: new Date().toISOString().split("T")[0],
+      VendorName: clean(item.vendor, 120) || undefined,
+      InvoiceNumber: clean(item.invoice_number, 60) || undefined,
+      BillNumber: clean(item.invoice_number, 60) || undefined,
+      Description: clean(item.description, 500) || undefined,
+      Narration: clean(item.description, 500) || clean(item.vendor, 120) || category.name,
+      Currency: "INR",
+      Source: "AskMira",
+    },
+  };
+}
+
+async function claimCreate(slug, me, params) {
+  const key = String(params.key || "");
+  if (!/^[A-Za-z0-9:_-]{6,80}$/.test(key)) throw httpError(422, "Every claim from AskMira needs its key.");
+  const expenseId = `askmira:${key}`;
+  const earlier = await pool.query(
+    `SELECT * FROM expenses WHERE unique_key = $1 AND LOWER(submitter_email) = LOWER($2) LIMIT 1`,
+    [expenseId, me.email],
+  );
+  if (earlier.rows[0]) {
+    const saved = masterExpense.rowToShape(earlier.rows[0]);
+    return { existing: true, claim: claimShape(saved), needs_bill: [] };
+  }
+  const title = clean(params.title, 200);
+  if (!title || title.length < 2) throw httpError(422, "What is the claim for? Give it a short title.");
+  const raw = Array.isArray(params.lines) ? params.lines : [];
+  if (!raw.length || raw.length > MAX_LINES) throw httpError(422, `A claim has between 1 and ${MAX_LINES} lines.`);
+  const { rows: categories } = await pool.query(
+    `SELECT name, normalized, requires_bill FROM expense_categories WHERE slug = $1 AND enabled IS NOT FALSE ORDER BY name`,
+    [slug],
+  );
+  const lines = raw.map((item, index) => lineOf(item, index, categories));
+
+  // The person's grade caps each category, as when they file it here.
+  const grade = me.grade ? String(me.grade) : "";
+  if (grade) {
+    const { rows: caps } = await pool.query(
+      `SELECT normalized, cap_amount, is_actuals FROM tenant_policy_caps WHERE slug = $1 AND grade = $2`,
+      [slug, grade],
+    );
+    const capOf = new Map(caps.map((c) => [String(c.normalized).toLowerCase(), c]));
+    // One bill split into lines is still one bill: lines of the same category and
+    // invoice number are added up before the cap is compared.
+    const bills = new Map();
+    lines.forEach(({ category, amount, line }, index) => {
+      const invoice = String(line.InvoiceNumber || "").trim().toLowerCase();
+      const key = `${category.name.toLowerCase()}|${invoice || `#${index}`}`;
+      const bill = bills.get(key) || { category, amount: 0 };
+      bill.amount = Math.round((bill.amount + amount) * 100) / 100;
+      bills.set(key, bill);
+    });
+    for (const { category, amount } of bills.values()) {
+      const cap = capOf.get(String(category.normalized || category.name).toLowerCase());
+      const limit = cap ? Number(cap.cap_amount) : 0;
+      if (cap && !cap.is_actuals && limit > 0 && amount > limit) {
+        throw httpError(422, `${category.name} is capped at ${rupees(limit)} for grade ${grade}; this bill is ${rupees(amount)}.`);
+      }
+    }
+  }
+
+  const repeated = await earlierClaimsOf(slug, me.email, raw);
+  if (repeated.length) {
+    const first = repeated[0];
+    throw httpError(409, `Line ${first.line}: this bill is already claimed in “${first.title}” (${first.status}). A bill is claimed once.`);
+  }
+
+  const routed = await masterExpense.resolveApprover(me.email, null);
+  if (routed.error) throw httpError(422, routed.error);
+  const needsBill = [...new Set(lines.filter((l) => l.category.requires_bill !== false).map((l) => l.category.name))];
+  const saved = await masterExpense.createExpense(
+    {
+      ExpenseTitle: title,
+      ExpenseId: expenseId,
+      SubmitterEmail: me.email,
+      SubmitterName: me.name || me.email,
+      ApproverEmail: routed.approver,
+      ApprovalStatus: needsBill.length ? "Draft" : "Pending",
+      ExpenseData: lines.map((l) => l.line),
+      Source: "AskMira",
+    },
+    {
+      comment: needsBill.length
+        ? `Filed from Ask Mira in AskMira. Kept as a draft: attach the bill for ${needsBill.join(", ")}, then send it.`
+        : "Filed from Ask Mira in AskMira and sent for approval.",
+      notifyDrafts: false,
+    },
+  );
+  return { existing: false, claim: claimShape(saved), needs_bill: needsBill };
+}
+
+function claimShape(saved) {
+  return {
+    reference: saved.ExpenseId,
+    title: saved.ExpenseTitle,
+    status: saved.ApprovalStatus,
+    // Rupees to the paisa: a float sum of 2838.60 + 4609.29 + 46.11 is 7493.999…
+    amount: (Math.round(Number(saved.TotalAmount || 0) * 100) / 100).toFixed(2),
+    approver: saved.ApproverEmail,
+  };
+}
+
+async function claimDecide(slug, me, params) {
+  const id = clean(params.id, 40);
+  const reference = clean(params.reference, 120);
+  const decision = String(params.decision || "");
+  if (!id && !reference) throw httpError(422, "Which claim? Give its id.");
+  if (!["approve", "reject"].includes(decision)) throw httpError(422, "decision is approve or reject.");
+  // The row AskMira showed, by its own id; a reference alone must name one claim only.
+  const { rows } = await pool.query(
+    `SELECT e.* FROM expenses e
+       JOIN employees s ON LOWER(s.email) = LOWER(e.submitter_email) AND s.tenant = $1
+      WHERE ${id ? "e.id = $2" : "e.unique_key = $2"}
+      LIMIT 2`,
+    [slug, id || reference],
+  );
+  if (rows.length > 1) throw httpError(409, "That reference names more than one claim. Decide it in ExpGenie.");
+  const row = rows[0];
+  if (!row) throw httpError(404, "No claim of this workspace has that reference.");
+  if (reference && id && row.unique_key !== reference) throw httpError(409, "That claim has changed. Look it up again.");
+  if (normEmail(row.submitter_email) === normEmail(me.email)) {
+    throw httpError(403, "You can't decide your own claim.");
+  }
+  // Decided as the step it waits at: only its current approver, never an admin's
+  // override (that is the dashboard's), so a claim that moved on to finance is not
+  // finalised by the manager who was shown it before.
+  if (normEmail(row.approver_email) !== normEmail(me.email)) {
+    throw httpError(403, "This claim isn't waiting on you: only its current approver decides it from Ask Mira.");
+  }
+  if (!/^pending/i.test(String(row.approval_status || ""))) {
+    throw httpError(409, `This claim is ${row.approval_status || "not pending"}, not waiting for approval.`);
+  }
+  const comment = clean(params.comment, 500);
+  const reason = clean(params.reason, 120) || (decision === "reject" ? clean(comment, 120) : "");
+  if (decision === "reject" && !reason) {
+    throw httpError(422, "Say why it is rejected: the submitter reads it.");
+  }
+  const updated = await masterExpense.updateStatus(
+    row.id,
+    {
+      ApprovalStatus: decision === "approve" ? "Approved" : "Rejected",
+      UpdatedBy: me.email,
+      Comments: comment ? `${comment} (from Ask Mira)` : "Decided from Ask Mira",
+      RejectionReason: reason || undefined,
+    },
+    { expectApprover: me.email },
+  );
+  return {
+    claim: {
+      reference: updated.ExpenseId,
+      title: updated.ExpenseTitle,
+      status: updated.ApprovalStatus,
+      // Approved by the manager with finance still to sign, it waits on finance now.
+      next_approver: updated.ApprovalStatus === "Pending" ? updated.ApproverEmail : null,
+    },
+  };
+}
+
+const ACTIONS = {
+  "claims.paid": { run: claimsPaid, admin: true },
+  "claim.create": { run: claimCreate, admin: false },
+  "claim.decide": { run: claimDecide, admin: false },
+};
+
+integrationRouter.post(
+  "/act",
+  handle(async (req) => {
+    const claims = await provisionClaims(req, "act");
+    const kind = String(req.body.kind || "");
+    const action = Object.prototype.hasOwnProperty.call(ACTIONS, kind) ? ACTIONS[kind] : null;
+    if (!action) throw httpError(422, "Unknown action.");
+    if (!claims.jti || typeof claims.exp !== "number") throw httpError(401, "This AskMira request is not valid.");
+    await pool.query(`DELETE FROM askmira_launches WHERE expires_at < NOW() - INTERVAL '5 minutes'`);
+    const fresh = await pool.query(
+      `INSERT INTO askmira_launches (jti, expires_at) VALUES ($1, to_timestamp($2))
+       ON CONFLICT (jti) DO NOTHING`,
+      [String(claims.jti).slice(0, 64), claims.exp],
+    );
+    if (!fresh.rowCount) throw httpError(401, "This request was already carried out.");
+
+    const slug = await linkedSlug(String(req.body.tenant_id));
+    if (!slug) throw httpError(404, "This workspace is not linked here yet.");
+    await refuseBlocked(slug);
+    const actor = req.body.actor && typeof req.body.actor === "object" ? req.body.actor : {};
+    const email = normEmail(actor.email);
+    const { rows } = await pool.query(
+      `SELECT email, name, role, grade, tenant, deactivated_at FROM employees WHERE LOWER(email) = LOWER($1) LIMIT 1`,
+      [email],
+    );
+    const me = rows[0];
+    if (!EMAIL_RE.test(email) || !me || me.tenant !== slug || me.deactivated_at || me.role === "super_admin") {
+      throw httpError(403, "You don't have an ExpGenie account in this workspace yet. Open ExpGenie once from AskMira, then ask again.");
+    }
+    if (action.admin && (me.role !== "admin" || String(actor.role || "") !== "admin")) {
+      throw httpError(403, "Recording payroll payments here is for an ExpGenie admin of this workspace.");
+    }
+    const params = req.body.params && typeof req.body.params === "object" ? req.body.params : {};
+    const result = await action.run(slug, me, params);
+    console.log(`[AskMira] act ${kind} for ${slug} by ${email}`);
+    return { kind, ...result };
   }),
 );
 
