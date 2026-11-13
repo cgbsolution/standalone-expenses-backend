@@ -76,6 +76,18 @@ function splitForInsert(payload, id) {
   return { flat, data };
 }
 
+// List queries select through this so every row carries its submitter's finance
+// person — the one who may record payment — and clients can show that action
+// to them alone. Use as `${EXPENSES_WITH_FINANCE} WHERE e.… ORDER BY e.…`.
+const EXPENSES_WITH_FINANCE = `
+  SELECT e.*, fin.finance_manager_email AS submitter_finance_email
+    FROM expenses e
+    LEFT JOIN LATERAL (
+      SELECT finance_manager_email FROM employees
+       WHERE LOWER(email) = LOWER(e.submitter_email)
+       LIMIT 1
+    ) fin ON true`;
+
 // Reconstruct the API response shape clients expect (top-level camelCase fields).
 function rowToShape(row) {
   if (!row) return null;
@@ -91,6 +103,11 @@ function rowToShape(row) {
     // Always present so clients can branch without an undefined check. Only
     // ever leaves "Unpaid" via POST /master-expense/:id/payment.
     PaymentStatus: row.data?.PaymentStatus || "Unpaid",
+    // Only on rows read through EXPENSES_WITH_FINANCE: the submitter's finance
+    // person, the only one who may record payment ("" when none is set).
+    ...("submitter_finance_email" in row
+      ? { PaymentOwnerEmail: row.submitter_finance_email || "" }
+      : {}),
     _ts: Math.floor(new Date(row.updated_at || row.created_at).getTime() / 1000),
   };
 }
@@ -262,16 +279,16 @@ router.get("/", async (req, res) => {
     let result;
     if (!approvalStatus || approvalStatus === "All") {
       result = await pool.query(
-        `SELECT * FROM expenses
-         WHERE submitter_email = $1
-         ORDER BY created_at DESC`,
+        `${EXPENSES_WITH_FINANCE}
+         WHERE e.submitter_email = $1
+         ORDER BY e.created_at DESC`,
         [email]
       );
     } else {
       result = await pool.query(
-        `SELECT * FROM expenses
-         WHERE submitter_email = $1 AND approval_status = $2
-         ORDER BY created_at DESC`,
+        `${EXPENSES_WITH_FINANCE}
+         WHERE e.submitter_email = $1 AND e.approval_status = $2
+         ORDER BY e.created_at DESC`,
         [email, approvalStatus]
       );
     }
@@ -305,9 +322,9 @@ router.get("/approver", async (req, res) => {
   try {
     if (!(await access.canActFor(req, email))) return access.deny(res);
     const { rows } = await pool.query(
-      `SELECT * FROM expenses
-       WHERE approver_email = $1
-       ORDER BY created_at DESC`,
+      `${EXPENSES_WITH_FINANCE}
+       WHERE e.approver_email = $1
+       ORDER BY e.created_at DESC`,
       [email]
     );
     return res.json(rows.map(rowToShape));
@@ -341,7 +358,7 @@ router.get("/tenant", async (req, res) => {
 
   try {
     const { rows } = await pool.query(
-      `SELECT e.* FROM expenses e
+      `${EXPENSES_WITH_FINANCE}
         WHERE EXISTS (
           SELECT 1 FROM employees emp
            WHERE emp.tenant = $1
@@ -388,16 +405,16 @@ router.get("/all", async (req, res) => {
     let result;
     if (status && status !== "All") {
       result = await pool.query(
-        `SELECT * FROM expenses
-         WHERE approval_status = $1
-         ORDER BY created_at DESC
+        `${EXPENSES_WITH_FINANCE}
+         WHERE e.approval_status = $1
+         ORDER BY e.created_at DESC
          LIMIT $2`,
         [status, lim]
       );
     } else {
       result = await pool.query(
-        `SELECT * FROM expenses
-         ORDER BY created_at DESC
+        `${EXPENSES_WITH_FINANCE}
+         ORDER BY e.created_at DESC
          LIMIT $1`,
         [lim]
       );
@@ -484,14 +501,14 @@ router.get("/non-self-approve", async (req, res) => {
   try {
     if (!(await access.canActFor(req, email))) return access.deny(res);
     const { rows } = await pool.query(
-      `SELECT * FROM expenses
-       WHERE approver_email = $1
-         AND approval_status = 'Pending'
+      `${EXPENSES_WITH_FINANCE}
+       WHERE e.approver_email = $1
+         AND e.approval_status = 'Pending'
          AND EXISTS (
-           SELECT 1 FROM jsonb_array_elements(COALESCE(data->'ExpenseData', '[]'::jsonb)) AS item
+           SELECT 1 FROM jsonb_array_elements(COALESCE(e.data->'ExpenseData', '[]'::jsonb)) AS item
            WHERE COALESCE((item->>'SelfApprove')::boolean, false) = false
          )
-       ORDER BY created_at DESC`,
+       ORDER BY e.created_at DESC`,
       [email]
     );
     return res.json(rows.map(rowToShape));
@@ -795,8 +812,8 @@ router.put("/by-id/:id", (req, res) => handleStatusUpdate(req, res, "Failed to u
  *
  * For tenants with no SAP connection there is nothing to post the approved
  * expense to, so payment never gets recorded anywhere. A super-admin can turn
- * on `manualPaymentEnabled` for such a tenant (tenant_config); the finance
- * approver who finalised the expense then ticks it off by hand here.
+ * on `manualPaymentEnabled` for such a tenant (tenant_config); the submitter's
+ * finance person then ticks it off by hand here.
  *
  * The flag is deliberately checked server-side on every call — the dashboard
  * hides the button, but the endpoint must not rely on that.
@@ -815,22 +832,16 @@ async function isManualPaymentEnabled(slug) {
   return Boolean(rows[0]?.config?.manualPaymentEnabled);
 }
 
-// The finance approver on the record can mark their own approval paid; tenant
-// admins can too (they cover for finance). Super-admins are unrestricted.
-async function canMarkPaid(actorEmail, row, slug) {
+// Only the submitter's finance person (employees.finance_manager_email) records
+// payment. Managers only approve or reject; a manager who is also the finance
+// person gets both. Tenant admins and whoever happened to finalise the expense
+// (the manager, when no finance person is set) do not — so an expense whose
+// submitter has no finance person can't be marked paid until one is set.
+async function canMarkPaid(actorEmail, row) {
   const actor = (actorEmail || "").toLowerCase();
   if (!actor) return false;
-  if (actor === (row.approver_email || "").toLowerCase()) return true;
-
-  const { rows } = await pool.query(
-    `SELECT role, tenant FROM employees WHERE LOWER(email) = LOWER($1) LIMIT 1`,
-    [actorEmail],
-  );
-  const employee = rows[0];
-  if (!employee) return false;
-  const role = (employee.role || "").toLowerCase();
-  if (role === "super_admin") return true;
-  return role === "admin" && employee.tenant === slug;
+  const finance = (await lookupFinanceManagerEmail(row.submitter_email)).toLowerCase();
+  return Boolean(finance) && actor === finance;
 }
 
 /**
@@ -841,8 +852,8 @@ async function canMarkPaid(actorEmail, row, slug) {
  *     description: |
  *       Only available when the expense's tenant has `manualPaymentEnabled`
  *       turned on by a super-admin (used when the tenant has no SAP connection
- *       to post payments through). The caller must be the finance approver on
- *       the expense, a tenant admin, or a super-admin.
+ *       to post payments through). The caller must be the submitter's finance
+ *       person; managers, tenant admins and super-admins cannot.
  *     tags: [MasterExpense]
  *     parameters:
  *       - in: path
@@ -910,9 +921,9 @@ router.post("/:id/payment", async (req, res) => {
         error: "Manual payment marking is not enabled for this tenant.",
       });
     }
-    if (!(await canMarkPaid(UpdatedBy, row, slug))) {
+    if (!(await canMarkPaid(UpdatedBy, row))) {
       return res.status(403).json({
-        error: "Only the finance approver on this expense or a tenant admin can record payment.",
+        error: "Only the submitter's finance person can record payment.",
       });
     }
 

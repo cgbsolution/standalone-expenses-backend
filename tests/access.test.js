@@ -274,8 +274,16 @@ describe("access control", { skip: SKIP }, () => {
   });
 
   test("manual payment", async () => {
-    const stranger = await api.call("POST", "/master-expense/X2/payment", { token: T["emp@beta.com"], body: { UpdatedBy: "fin@acme.com" } });
+    const pay = (who) => api.call("POST", "/master-expense/X2/payment", { token: T[who], body: { UpdatedBy: "fin@acme.com" } });
+    const stranger = await pay("emp@beta.com");
     assert.ok([403, 409].includes(stranger.status));
+    assert.equal((await pay("mgr@acme.com")).status, 403, "a manager only approves or rejects");
+    assert.equal((await pay("admin@acme.com")).status, 403, "a tenant admin doesn't cover for finance");
+    assert.equal((await pay("sa@platform.com")).status, 403, "nor does a super-admin");
+
+    const tenantList = await get("/master-expense/tenant?slug=acme", T["admin@acme.com"]);
+    assert.equal(tenantList.data.find((e) => e.id === "X2").PaymentOwnerEmail, "fin@acme.com");
+
     const paid = await api.call("POST", "/master-expense/X2/payment", { token: T["fin@acme.com"], body: { UpdatedBy: "someone@else.com" } });
     assert.equal(paid.status, 200);
     assert.equal(paid.data.PaymentInfo.PaidBy, "fin@acme.com", "recorded as the caller");
